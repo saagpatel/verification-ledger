@@ -5,9 +5,9 @@ description = "A governed coordination ledger for local multi-agent fleets: prov
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
-dependencies = [
-    "aiosqlite>=0.20",
-]
+# The core library and the conformance suite are stdlib-only (sqlite3) — zero
+# runtime dependencies, so it drops into any fleet without a supply-chain cost.
+dependencies = []
 
 [project.optional-dependencies]
 # The MCP server wrapper (drop-in for an MCP-speaking fleet) is opt-in; the
@@ -21,7 +21,6 @@ verification-ledger = "verification_ledger.__main__:main"
 dev = [
     "pyright>=1.1.411",
     "pytest>=9.1.1",
-    "pytest-asyncio>=0.24.0",
     "ruff>=0.15.20",
 ]
 
@@ -34,7 +33,6 @@ packages = ["src/verification_ledger"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-asyncio_mode = "auto"
 
 [tool.pyright]
 pythonVersion = "3.12"
