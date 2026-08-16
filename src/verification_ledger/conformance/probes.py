@@ -59,11 +59,11 @@ def _vl1_adv_in_band_operator_clamped(a: LedgerAdapter) -> bool:
 
 
 def _vl2_pos_operator_activates(a: LedgerAdapter) -> bool:
-    # An operator record (seeded via the out-of-band channel) activates in one call,
-    # and the PERSISTED state reflects it — not just the return value.
-    rid = a.write(
-        "directive", source_trust=OPERATOR, channel=OUT_OF_BAND, durable=False
-    )
+    # An operator record (seeded via the store's own out-of-band ceremony —
+    # whatever that is) activates in one in-band call, and the PERSISTED state
+    # reflects it, not just the return value. Using the adapter's seed_operator
+    # keeps this probe agnostic to how the store mints operator trust.
+    rid = a.seed_operator("directive")
     activated = a.activate(rid, channel=IN_BAND)
     r = a.read(rid)
     return activated is True and r is not None and r.actionable is True
@@ -137,17 +137,25 @@ def _vl3_adv_envelope_reflects_real_trust(a: LedgerAdapter) -> bool:
 
 
 def _vl4_pos_prunes_non_durable_to_cap(a: LedgerAdapter) -> bool:
+    # Overflow the store's own declared cap, then prune. The legitimate outcome:
+    # exactly `cap` non-durable records survive, the one durable record is exempt,
+    # and the store still reports healthy.
+    cap = a.prune_cap()
     a.write("keep", source_trust=AGENT, channel=IN_BAND, durable=True)
-    for i in range(5):
+    for i in range(cap + 3):
         a.write(f"n{i}", source_trust=AGENT, channel=IN_BAND, durable=False)
-    a.prune(keep=2)
-    # 1 durable + newest 2 non-durable = 3; and the store still reports healthy.
-    return a.count_records() == 3 and a.health_ok() is True
+    a.prune()
+    return a.count_records() == cap + 1 and a.health_ok() is True
 
 
 def _vl4_adv_durable_survives_aggressive_prune(a: LedgerAdapter) -> bool:
+    # Flood well past the cap so pruning is forced to act, then confirm the durable
+    # record still survives — retention exemption must hold under real pressure.
+    cap = a.prune_cap()
     rid = a.write("shipped", source_trust=AGENT, channel=IN_BAND, durable=True)
-    a.prune(keep=0)  # ask to prune everything
+    for i in range(cap + 3):
+        a.write(f"n{i}", source_trust=AGENT, channel=IN_BAND, durable=False)
+    a.prune()
     return a.read(rid) is not None  # the durable record must remain
 
 
