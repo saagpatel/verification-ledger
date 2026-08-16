@@ -1,0 +1,51 @@
+[project]
+name = "verification-ledger"
+version = "0.1.0"
+description = "A governed coordination ledger for local multi-agent fleets: provenance typing, a promotion gate, an instruction-boundary envelope, and a retention invariant — with an executable conformance suite that proves them."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = [
+    "aiosqlite>=0.20",
+]
+
+[project.optional-dependencies]
+# The MCP server wrapper (drop-in for an MCP-speaking fleet) is opt-in; the
+# core library and the conformance suite have no MCP dependency.
+mcp = ["mcp>=1.28.1,<2.0"]
+
+[project.scripts]
+verification-ledger = "verification_ledger.__main__:main"
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.411",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.15.20",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/verification_ledger"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.pyright]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
+venvPath = "."
+venv = ".venv"
+include = ["src", "tests"]
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "SIM"]
+ignore = ["E501"]
