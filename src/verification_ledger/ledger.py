@@ -1,10 +1,10 @@
 """The reference implementation: a SQLite-backed governed ledger.
 
 Implements VL-1 (provenance typing with the in-band operator clamp), the VL-3
-read envelope, and the VL-2 promotion gate (activation + out-of-band promotion).
-VL-4 retention builds on this store in Phase 3. Deliberately small — stdlib
-``sqlite3``, one table, zero external dependencies — a store readable in one
-sitting.
+read envelope, the VL-2 promotion gate (activation + out-of-band promotion), and
+VL-4 retention (the durable exemption plus a health check that detects durable
+loss). Deliberately small — stdlib ``sqlite3``, zero external dependencies — a
+store readable in one sitting.
 """
 
 from __future__ import annotations
@@ -17,7 +17,9 @@ from pathlib import Path
 
 from verification_ledger.envelope import Envelope, boundary
 from verification_ledger.gate import evaluate_activation, evaluate_promotion
+from verification_ledger.invariants import FailurePolicy, InvariantMonitor
 from verification_ledger.model import DEFAULT_TRUST, Channel, Record, Trust
+from verification_ledger.retention import RetentionCandidate, select_prunable
 
 logger = logging.getLogger("verification_ledger.ledger")
 
@@ -29,6 +31,13 @@ CREATE TABLE IF NOT EXISTS records (
     durable      INTEGER NOT NULL DEFAULT 0 CHECK (durable IN (0, 1)),
     actionable   INTEGER NOT NULL DEFAULT 0 CHECK (actionable IN (0, 1)),
     created_at   TEXT NOT NULL
+);
+-- A durable receipt is written for every durable record. VL-4's health check
+-- cross-checks it against the records table: a receipt with no live durable
+-- record means a durable record was lost — the detectable violation.
+CREATE TABLE IF NOT EXISTS durable_receipts (
+    record_id  INTEGER PRIMARY KEY,
+    created_at TEXT NOT NULL
 );
 """
 
@@ -70,6 +79,26 @@ class PromotionResult:
     source_trust: Trust
 
 
+@dataclass(frozen=True)
+class PruneResult:
+    """Outcome of a prune: which non-durable records were removed."""
+
+    pruned_ids: tuple[int, ...]
+    pruned_count: int
+
+
+@dataclass(frozen=True)
+class HealthReport:
+    """VL-4 health: counts plus the durable-loss violation surface."""
+
+    ok: bool
+    total: int
+    durable_protected: int
+    prunable: int
+    durable_orphans: int
+    violations: tuple[str, ...]
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
@@ -77,7 +106,13 @@ def _utc_now() -> str:
 class Ledger:
     """A governed coordination store. Open with a path, or ``:memory:`` (default)."""
 
-    def __init__(self, path: str | Path = ":memory:") -> None:
+    def __init__(
+        self,
+        path: str | Path = ":memory:",
+        *,
+        policy: FailurePolicy = FailurePolicy.RAISE,
+    ) -> None:
+        self._policy = policy
         self._conn = sqlite3.connect(str(path))
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -115,15 +150,24 @@ class Ledger:
             logger.warning(
                 "clamped in-band operator write to agent (payload len=%d)", len(payload)
             )
+        created_at = _utc_now()
         cursor = self._conn.execute(
             "INSERT INTO records (payload, source_trust, durable, actionable, created_at) "
             "VALUES (?, ?, ?, 0, ?)",
-            (payload, str(source_trust), 1 if durable else 0, _utc_now()),
+            (payload, str(source_trust), 1 if durable else 0, created_at),
         )
-        self._conn.commit()
         rowid = cursor.lastrowid
         if rowid is None:  # pragma: no cover — an INSERT always yields a rowid
             raise RuntimeError("insert did not produce a row id")
+        if durable:
+            # VL-4: the durable receipt is the independent tally the health check
+            # verifies against — if this record ever disappears, the receipt
+            # orphans and the loss becomes detectable. Same transaction as the row.
+            self._conn.execute(
+                "INSERT INTO durable_receipts (record_id, created_at) VALUES (?, ?)",
+                (int(rowid), created_at),
+            )
+        self._conn.commit()
         return WriteResult(
             record_id=int(rowid), source_trust=source_trust, clamped=clamped
         )
@@ -237,6 +281,71 @@ class Ledger:
             "promotion: record=%d %s -> operator (out-of-band)", record_id, current
         )
         return PromotionResult(record_id, True, "promoted to operator", Trust.OPERATOR)
+
+    def prune(self, *, keep: int) -> PruneResult:
+        """VL-4: prune non-durable records to the newest ``keep``; never a durable one.
+
+        Durable records are exempt and uncounted against the cap. The delete has a
+        SQL-level ``durable = 0`` backstop in addition to the pure selection, so a
+        durable record cannot be removed even if the selection were wrong; a
+        mismatch trips the invariant monitor.
+        """
+        rows = self._conn.execute(
+            "SELECT id, durable FROM records ORDER BY id DESC"
+        ).fetchall()
+        candidates = [
+            RetentionCandidate(int(r["id"]), bool(r["durable"])) for r in rows
+        ]
+        to_delete = select_prunable(candidates, keep=keep)
+        if not to_delete:
+            return PruneResult(pruned_ids=(), pruned_count=0)
+        placeholders = ",".join("?" for _ in to_delete)
+        cursor = self._conn.execute(
+            f"DELETE FROM records WHERE id IN ({placeholders}) AND durable = 0",
+            to_delete,
+        )
+        self._conn.commit()
+        deleted = cursor.rowcount
+        InvariantMonitor(self._policy).always(
+            deleted == len(to_delete),
+            f"VL-4: prune removed {deleted} of {len(to_delete)} targeted rows; "
+            "a durable row must never be targeted",
+        )
+        logger.info("pruned %d non-durable records", deleted)
+        return PruneResult(pruned_ids=tuple(to_delete), pruned_count=deleted)
+
+    def health(self) -> HealthReport:
+        """VL-4: report retention health and detect any durable-record loss.
+
+        A ``durable_receipts`` row with no live durable record means a durable
+        record was lost. Under ``RAISE`` this call raises on a violation; under
+        ``REPORT`` it returns a report with ``ok=False`` and the orphan count.
+        """
+        total = self._count("SELECT COUNT(*) FROM records")
+        durable = self._count("SELECT COUNT(*) FROM records WHERE durable = 1")
+        prunable = self._count("SELECT COUNT(*) FROM records WHERE durable = 0")
+        orphans = self._count(
+            "SELECT COUNT(*) FROM durable_receipts dr WHERE NOT EXISTS ("
+            "SELECT 1 FROM records r WHERE r.id = dr.record_id AND r.durable = 1)"
+        )
+        monitor = InvariantMonitor(self._policy)
+        ok = monitor.always(
+            orphans == 0,
+            f"VL-4: {orphans} durable record(s) lost or demoted — retention must "
+            "never drop a durable record",
+        )
+        return HealthReport(
+            ok=ok,
+            total=total,
+            durable_protected=durable,
+            prunable=prunable,
+            durable_orphans=orphans,
+            violations=monitor.violations,
+        )
+
+    def _count(self, sql: str) -> int:
+        row = self._conn.execute(sql).fetchone()
+        return int(row[0]) if row is not None else 0
 
     def _envelop(self, row: sqlite3.Row) -> EnvelopedRecord:
         trust = Trust(row["source_trust"])
