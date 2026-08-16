@@ -1,12 +1,22 @@
 """CLI entry point for verification-ledger.
 
-Phase 0 provides ``--version`` and a pointer to the contract. The promotion
-ceremony (VL-2) and the conformance runner land in later phases.
+Subcommands:
+  --version                        print the package version
+  promote <db_path> <record_id>    the out-of-band operator promotion ceremony
+
+The conformance runner (``python -m verification_ledger.conformance``) lands in
+a later phase.
 """
 
 from __future__ import annotations
 
 import sys
+
+_USAGE = (
+    "verification-ledger — subcommands:\n"
+    "  --version                      print the package version\n"
+    "  promote <db_path> <record_id>  out-of-band operator promotion (SPEC.md § VL-2)\n"
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -16,10 +26,11 @@ def main(argv: list[str] | None = None) -> int:
 
         print(__version__)
         return 0
-    print(
-        "verification-ledger — see SPEC.md for the ledger contract. "
-        "The promotion CLI and conformance runner land in later phases."
-    )
+    if args and args[0] == "promote":
+        from verification_ledger.promote import main as promote_main
+
+        return promote_main(args[1:])
+    print(_USAGE, end="")
     return 0
 
 
