@@ -56,8 +56,32 @@ class LedgerAdapter(Protocol):
         """Attempt to mint operator trust; return whether the record is now operator."""
         ...
 
-    def prune(self, *, keep: int) -> None:
-        """Prune non-durable records to the newest ``keep``; durable records are exempt."""
+    def seed_operator(self, payload: str) -> int:
+        """Seed one record at ``operator`` trust via the store's OUT-OF-BAND ceremony
+        and return its id.
+
+        This is the store's own legitimate operator-write path, and the suite is
+        deliberately agnostic about which one it is: an out-of-band write for a
+        store that supports one, or an in-band ``agent`` write followed by the
+        out-of-band promotion ceremony for a store (such as bridge-db) that mints
+        ``operator`` only through promotion. It must NOT take any in-band
+        shortcut — the VL-2 adversarial probes independently verify that the
+        in-band path to ``operator`` stays closed, so declaring the seed here
+        cannot be used to game the score.
+        """
+        ...
+
+    def prune(self) -> None:
+        """Prune non-durable records to this store's own cap (``prune_cap``);
+        durable records are exempt. A store that prunes automatically on write may
+        implement this as a no-op."""
+        ...
+
+    def prune_cap(self) -> int:
+        """The store's non-durable retention cap: the number of non-durable records
+        it keeps after pruning. The suite sizes its VL-4 workload from this so a
+        store with a fixed cap (bridge-db keeps 50 per source) and one with a
+        configurable cap are graded the same way."""
         ...
 
     def count_records(self) -> int:

@@ -133,12 +133,32 @@ scores `1.0`. The bundled reference implementation is required to score `1.0`.
 
 ## The adapter contract
 
-A store demonstrates conformance by implementing a small adapter (roughly five
-methods: write, read, attempt-in-band-promotion, prune, health) against the
-`LedgerAdapter` protocol in `verification_ledger.conformance.contract`. The suite
-runs entirely against that protocol, so it grades the bundled reference
-implementation and any third-party store the same way. The suite is the
-standard; the reference implementation is one conformant store.
+A store demonstrates conformance by implementing a small adapter against the
+`LedgerAdapter` protocol in `verification_ledger.conformance.contract`. Most of
+its methods are the obvious ones — write, read, activate, promote, prune, count,
+health. Two exist so the suite can grade stores with different internal mechanics
+the same way, rather than assuming the reference's:
+
+- **`seed_operator(payload)`** — the adapter performs its store's *own*
+  out-of-band operator ceremony and returns the record id. A store that allows a
+  direct out-of-band operator write does that; a store that mints `operator` only
+  through promotion (bridge-db) writes an `agent` record and runs its out-of-band
+  promotion here. Either is legitimate; the suite does not care which. This is
+  used only by the VL-2 *positive* probe (the operator fast path); the VL-2
+  adversarial probes independently verify the in-band path to `operator` stays
+  closed, so declaring the seed cannot be used to game the score.
+- **`prune_cap()`** — the store's non-durable retention cap. The VL-4 probes size
+  their workload from this and expect exactly `cap` non-durable records to
+  survive, so a store with a fixed cap (bridge-db keeps 50 per source) and one
+  with a configurable cap are graded identically. `prune()` takes no argument: it
+  prunes to the store's own cap, and a store that auto-prunes on write may make it
+  a no-op.
+
+The suite runs entirely against this protocol, so it grades the bundled reference
+implementation and any third-party store the same way. The suite is the standard;
+the reference implementation is one conformant store. A worked second adapter —
+bridge-db, which is stricter than the reference — is in
+[docs/adopters.md](docs/adopters.md).
 
 ## Non-goals (honest scope)
 

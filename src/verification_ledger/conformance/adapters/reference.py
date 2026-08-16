@@ -15,6 +15,10 @@ from verification_ledger.model import Channel, Trust
 class ReferenceAdapter:
     """Grades ``verification_ledger.ledger.Ledger`` against the conformance suite."""
 
+    # The reference store takes an arbitrary prune cap; the suite reads this one
+    # value and sizes its VL-4 workload from it. A small cap keeps probes fast.
+    PRUNE_CAP = 3
+
     def __init__(self) -> None:
         # REPORT policy: a VL-4 violation degrades health_ok() rather than raising,
         # so the suite reads a boolean instead of catching an exception.
@@ -60,8 +64,19 @@ class ReferenceAdapter:
         record = self.read(record_id)
         return record is not None and record.source_trust == str(Trust.OPERATOR)
 
-    def prune(self, *, keep: int) -> None:
-        self._led.prune(keep=keep)
+    def seed_operator(self, payload: str) -> int:
+        # The reference supports a direct out-of-band operator write, so its
+        # ceremony is one call. (A promotion-only store would write agent then
+        # promote out-of-band here instead.)
+        return self._led.write(
+            payload, source_trust=Trust.OPERATOR, channel=Channel.OUT_OF_BAND
+        ).record_id
+
+    def prune(self) -> None:
+        self._led.prune(keep=self.PRUNE_CAP)
+
+    def prune_cap(self) -> int:
+        return self.PRUNE_CAP
 
     def count_records(self) -> int:
         return len(self._led.read_all())

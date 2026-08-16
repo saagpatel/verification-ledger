@@ -33,6 +33,10 @@ def _envelope(trust: str) -> dict[str, str]:
     }
 
 
+# The test doubles all use one small cap; the suite reads it via prune_cap().
+_DOUBLE_CAP = 3
+
+
 def _correct_prune(rows: dict[int, _Row], keep: int) -> None:
     non_durable = [i for i in sorted(rows, reverse=True) if not rows[i].durable]
     for i in non_durable[keep:]:
@@ -72,8 +76,16 @@ class _AllowEverythingAdapter:
         self._rows[record_id].trust = "operator"  # even in-band
         return True
 
-    def prune(self, *, keep: int) -> None:
-        _correct_prune(self._rows, keep)
+    def seed_operator(self, payload: str) -> int:
+        return self.write(
+            payload, source_trust=c.OPERATOR, channel=c.OUT_OF_BAND, durable=False
+        )
+
+    def prune(self) -> None:
+        _correct_prune(self._rows, _DOUBLE_CAP)
+
+    def prune_cap(self) -> int:
+        return _DOUBLE_CAP
 
     def count_records(self) -> int:
         return len(self._rows)
@@ -116,8 +128,16 @@ class _BlockEverythingAdapter:
     def promote(self, record_id: int, *, channel: str) -> bool:
         return False
 
-    def prune(self, *, keep: int) -> None:
-        _correct_prune(self._rows, keep)
+    def seed_operator(self, payload: str) -> int:
+        return self.write(
+            payload, source_trust=c.OPERATOR, channel=c.OUT_OF_BAND, durable=False
+        )
+
+    def prune(self) -> None:
+        _correct_prune(self._rows, _DOUBLE_CAP)
+
+    def prune_cap(self) -> int:
+        return _DOUBLE_CAP
 
     def count_records(self) -> int:
         return len(self._rows)
@@ -168,8 +188,16 @@ class _BornActionableAdapter:
             return True
         return False
 
-    def prune(self, *, keep: int) -> None:
-        _correct_prune(self._rows, keep)
+    def seed_operator(self, payload: str) -> int:
+        return self.write(
+            payload, source_trust=c.OPERATOR, channel=c.OUT_OF_BAND, durable=False
+        )
+
+    def prune(self) -> None:
+        _correct_prune(self._rows, _DOUBLE_CAP)
+
+    def prune_cap(self) -> int:
+        return _DOUBLE_CAP
 
     def count_records(self) -> int:
         return len(self._rows)
