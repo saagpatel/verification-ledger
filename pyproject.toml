@@ -19,6 +19,7 @@ verification-ledger = "verification_ledger.__main__:main"
 
 [dependency-groups]
 dev = [
+    "mcp>=1.28.1,<2.0",
     "pyright>=1.1.411",
     "pytest>=9.1.1",
     "ruff>=0.15.20",

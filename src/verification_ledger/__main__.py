@@ -3,9 +3,10 @@
 Subcommands:
   --version                        print the package version
   promote <db_path> <record_id>    the out-of-band operator promotion ceremony
+  serve [db_path]                  run the in-band MCP stdio server (needs the mcp extra)
+  demo                             run the scripted replay on synthetic data
 
-The conformance runner (``python -m verification_ledger.conformance``) lands in
-a later phase.
+The conformance runner is ``python -m verification_ledger.conformance``.
 """
 
 from __future__ import annotations
@@ -16,6 +17,8 @@ _USAGE = (
     "verification-ledger — subcommands:\n"
     "  --version                      print the package version\n"
     "  promote <db_path> <record_id>  out-of-band operator promotion (SPEC.md § VL-2)\n"
+    "  serve [db_path]                in-band MCP stdio server (needs the mcp extra)\n"
+    "  demo                           scripted replay on synthetic data\n"
 )
 
 
@@ -30,6 +33,21 @@ def main(argv: list[str] | None = None) -> int:
         from verification_ledger.promote import main as promote_main
 
         return promote_main(args[1:])
+    if args and args[0] == "serve":
+        from verification_ledger.server import main as serve_main
+
+        try:
+            return serve_main(args[1:])
+        except ImportError:
+            print(
+                "the MCP server requires the 'mcp' extra: "
+                "pip install 'verification-ledger[mcp]'"
+            )
+            return 1
+    if args and args[0] == "demo":
+        from verification_ledger.demo.replay import main as demo_main
+
+        return demo_main()
     print(_USAGE, end="")
     return 0
 

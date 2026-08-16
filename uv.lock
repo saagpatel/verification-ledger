@@ -756,6 +756,7 @@ mcp = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "mcp" },
     { name = "pyright" },
     { name = "pytest" },
     { name = "ruff" },
@@ -767,6 +768,7 @@ provides-extras = ["mcp"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "mcp", specifier = ">=1.28.1,<2.0" },
     { name = "pyright", specifier = ">=1.1.411" },
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "ruff", specifier = ">=0.15.20" },
