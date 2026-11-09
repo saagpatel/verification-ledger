@@ -74,7 +74,9 @@ that status by merely declaring an unsupported operation.
 Missing provenance is represented as `null`, **not** `Unreadable`. Readable
 storage with no provenance field fails VL-1's positives: “storage has no
 provenance field; any writer's claim is lost.” Per-field unreadability does not
-prevent grading retention when note identities and text are readable.
+block the VL-4 read-agreement probe when note identities and text are readable.
+The restart, deletion, and burst probes compare provenance exactly, so
+unreadable provenance makes them, and therefore VL-4, `NOT_GRADABLE`.
 
 ## Grade JSON contract, suite version 1.0.0
 
