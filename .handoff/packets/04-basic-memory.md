@@ -3,7 +3,7 @@
 ## Goal
 Let the Memory Crash Test probes drive basic-memory (markdown notes plus a SQLite index) and read what it actually persisted. When this is done, all four guarantees produce a real grade (PASS, FAIL or NOT_GRADABLE, with evidence) for one exact pinned release.
 
-Read first: `.handoff/stress-test.md` (this server's findings and the recommended mapping table; follow it), `docs/memory-crash-test.md`, `src/memory_crash_test/adapters/base.py`, `inspect/base.py`, the reference fixture adapter/inspector, and `servers.py`.
+Read first: the stress-test findings (kept outside the repo) (this server's findings and the recommended mapping table; follow it), `docs/memory-crash-test.md`, `src/memory_crash_test/adapters/base.py`, `inspect/base.py`, the reference fixture adapter/inspector, and `servers.py`.
 
 ## Scope
 - `src/memory_crash_test/adapters/basic_memory.py` and `src/memory_crash_test/inspect/basic_memory.py`, registered in `servers.py` as `basic-memory`.
