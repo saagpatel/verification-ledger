@@ -1,12 +1,25 @@
 """Native server smoke/grade and offline JSONL inspection."""
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from memory_crash_test.adapters.server_memory import ServerMemoryAdapter
+from memory_crash_test.adapters.server_memory import install
 from memory_crash_test.grade.grader import grade_server
 from memory_crash_test.inspect.base import GraphSnapshot, StoredNote
 from memory_crash_test.inspect.server_memory import ServerMemoryInspector
+
+
+def test_install_resolves_relative_cache_without_launching_server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MCT_CACHE", "relative-cache")
+    with patch("memory_crash_test.adapters.server_memory.subprocess.run"):
+        package = install()
+
+    cache_root = (tmp_path / "relative-cache").resolve()
+    assert package == cache_root / "server-memory" / "2.1.0" / "node_modules" / "@modelcontextprotocol" / "server-memory"
+    assert package.is_absolute()
 
 
 def test_inspector_sample(tmp_path: Path) -> None:

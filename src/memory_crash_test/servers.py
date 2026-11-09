@@ -16,13 +16,29 @@ from memory_crash_test.inspect.server_memory import ServerMemoryInspector
 
 @dataclass(frozen=True)
 class ServerBinding:
+    registry_key: str
+    name: str
+    source: str
+    version: str
     adapter_factory: Callable[[], MemoryServerAdapter]
     inspector_factory: Callable[[], StorageInspector]
 
 
 SERVERS: dict[str, ServerBinding] = {
-    "server-memory": ServerBinding(ServerMemoryAdapter, ServerMemoryInspector),
-    "reference": ServerBinding(ReferenceAdapter, ReferenceInspector),
-    "cheating-store": ServerBinding(CheatingAdapter, ReferenceInspector),
-    "basic-memory": ServerBinding(BasicMemoryAdapter, BasicMemoryInspector),
+    "server-memory": ServerBinding(
+        "server-memory", "@modelcontextprotocol/server-memory", "npm", "2.1.0",
+        ServerMemoryAdapter, ServerMemoryInspector,
+    ),
+    "reference": ServerBinding(
+        "reference", "memory-crash-test-reference", "fixture", "1.0.0",
+        ReferenceAdapter, ReferenceInspector,
+    ),
+    "cheating-store": ServerBinding(
+        "cheating-store", "mct-cheating-store", "fixture", "fixture",
+        CheatingAdapter, ReferenceInspector,
+    ),
+    "basic-memory": ServerBinding(
+        "basic-memory", "basic-memory", "https://pypi.org/project/basic-memory/1.0.0/", "1.0.0",
+        BasicMemoryAdapter, BasicMemoryInspector,
+    ),
 }
