@@ -24,5 +24,13 @@ class StoredNote:
 type StorageSnapshot = dict[str, StoredNote]
 
 
+class EvidenceSnapshot(dict[str, StoredNote]):
+    """Optional secondary evidence; dict equality still compares only notes."""
+
+    def __init__(self, *, evidence: dict[str, object]) -> None:
+        super().__init__()
+        self.evidence = evidence
+
+
 class StorageInspector(Protocol):
     def snapshot(self, storage_dir: Path) -> StorageSnapshot | Unreadable: ...

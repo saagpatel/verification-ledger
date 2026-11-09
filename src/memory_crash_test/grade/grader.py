@@ -12,7 +12,7 @@ from tempfile import TemporaryDirectory
 from memory_crash_test import SUITE_VERSION
 from memory_crash_test._json import mapping, sequence, string
 from memory_crash_test.adapters.base import CallRecord, MemoryServerAdapter, Provenance, ServerRelease
-from memory_crash_test.inspect.base import StorageInspector, StorageSnapshot, StoredNote, Unreadable
+from memory_crash_test.inspect.base import EvidenceSnapshot, StorageInspector, StorageSnapshot, StoredNote, Unreadable
 from memory_crash_test.probes.vl import (
     GUARANTEES, Guarantee, ProbeKind, ProbeResult, Status, all_probes, safe_snapshot,
 )
@@ -114,7 +114,7 @@ def _one_line(text: str) -> str:
     return " ".join(text.splitlines())
 
 
-def _snapshot_json(snapshot: StorageSnapshot | Unreadable) -> dict[str, object]:
+def snapshot_json(snapshot: StorageSnapshot | Unreadable) -> dict[str, object]:
     if isinstance(snapshot, Unreadable):
         return {"unreadable": snapshot.reason}
     notes: dict[str, object] = {}
@@ -124,14 +124,17 @@ def _snapshot_json(snapshot: StorageSnapshot | Unreadable) -> dict[str, object]:
             "key": note.key, "text": note.text,
             "provenance": {"unreadable": provenance.reason} if isinstance(provenance, Unreadable) else provenance,
         }
-    return {"notes": notes}
+    result: dict[str, object] = {"notes": notes}
+    if isinstance(snapshot, EvidenceSnapshot):
+        result["evidence"] = snapshot.evidence
+    return result
 
 
 def _probe_json(probe: ProbeResult) -> dict[str, object]:
     return {
         "guarantee": probe.guarantee, "kind": probe.kind, "name": probe.name,
         "status": probe.status, "reason": probe.reason,
-        "before": _snapshot_json(probe.before), "after": _snapshot_json(probe.after),
+        "before": snapshot_json(probe.before), "after": snapshot_json(probe.after),
         "calls": [{"tool_name": call.tool_name, "args": call.args} for call in probe.calls],
     }
 
@@ -140,7 +143,9 @@ def _parse_snapshot(value: object) -> StorageSnapshot | Unreadable:
     data = mapping(value)
     if "unreadable" in data:
         return Unreadable(string(data["unreadable"]))
-    notes: StorageSnapshot = {}
+    notes: StorageSnapshot = (
+        EvidenceSnapshot(evidence=mapping(data["evidence"])) if "evidence" in data else {}
+    )
     for key, item in mapping(data["notes"]).items():
         note = mapping(item)
         provenance = note["provenance"]
