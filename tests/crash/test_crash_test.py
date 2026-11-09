@@ -123,7 +123,7 @@ def test_unreadable_provenance_is_not_gradable_for_vl1(tmp_path: Path) -> None:
     vl3 = next(item for item in grade.guarantees if item.guarantee == "VL-3")
     assert all(probe.status == "NOT_GRADABLE" for probe in vl3.probes)
     vl4 = next(item for item in grade.guarantees if item.guarantee == "VL-4")
-    assert vl4.status == "PASS"
+    assert vl4.status == "NOT_GRADABLE"
     assert ServerGrade.from_json(grade.to_json()) == grade
 
 
@@ -140,7 +140,7 @@ def test_missing_provenance_is_a_vl1_failure(tmp_path: Path) -> None:
     assert vl1.probes[2].status == "PASS"
     assert vl1.probes[2].reason == "stored as None"
     vl4 = next(item for item in grade.guarantees if item.guarantee == "VL-4")
-    assert vl4.status == "PASS"
+    assert vl4.status == "FAIL"
 
 
 def test_reference_inspector_reads_stopped_storage_and_marks_corruption(tmp_path: Path) -> None:
@@ -572,8 +572,40 @@ def test_vl4_final_snapshot_checks_text_with_unassessable_provenance(
         result = late_change.run(adapter, _DoubleInspector(adapter), tmp_path)
     finally:
         adapter.stop()
-    assert result.status == ("FAIL" if corrupt_text else "PASS")
-    assert result.reason == ("final storage differs from expected: note-03.text" if corrupt_text else "")
+    if provenance is None:
+        assert result.status == "FAIL"
+        fields = "note-03.text, note-03.provenance" if corrupt_text else "note-03.provenance"
+        assert result.reason == f"final storage differs from expected: {fields}"
+    elif corrupt_text:
+        assert result.status == "FAIL"
+        assert result.reason == "final storage differs from expected: note-03.text"
+    else:
+        assert result.status == "NOT_GRADABLE"
+        assert result.reason == "provenance unavailable"
+
+
+@pytest.mark.parametrize("probe_name,extra_key", [
+    ("delete removes exactly one note", "note-05"),
+    ("12 notes survive restart and are readable", "unexpected"),
+])
+def test_vl4_final_snapshot_rejects_late_extra_key(
+    tmp_path: Path, probe_name: str, extra_key: str,
+) -> None:
+    adapter = _RetentionAdapter()
+    probe = next(probe for probe in all_probes() if probe.name == probe_name)
+
+    def add_extra() -> None:
+        text = "synthetic text 05" if extra_key == "note-05" else "late write"
+        adapter.notes[extra_key] = StoredNote(extra_key, text, "agent")
+
+    late_write = Probe(probe.guarantee, probe.kind, probe.name, lambda context: probe.check(context) or add_extra())
+    adapter.start(tmp_path)
+    try:
+        result = late_write.run(adapter, _DoubleInspector(adapter), tmp_path)
+    finally:
+        adapter.stop()
+    assert result.status == "FAIL"
+    assert result.reason == f"final storage differs from expected: {extra_key}"
 
 
 def _double_grade(mode: Mode, tmp_path: Path) -> ServerGrade:

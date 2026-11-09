@@ -116,8 +116,13 @@ def _take_snapshot(inspector: StorageInspector, storage_dir: Path) -> tuple[Stor
         return Unreadable(reason), reason
 
 
-def _final_difference(snapshot: StorageSnapshot, expected: dict[str, ExpectedNote]) -> str | None:
+def _final_difference(
+    snapshot: StorageSnapshot, expected: dict[str, ExpectedNote], *, exact: bool = False,
+) -> str | None:
     differences: list[str] = []
+    unreadable: Unreadable | None = None
+    if exact:
+        differences.extend(sorted(set(snapshot) - set(expected)))
     for key, note in sorted(expected.items()):
         stored = snapshot.get(key)
         if stored is None:
@@ -125,13 +130,16 @@ def _final_difference(snapshot: StorageSnapshot, expected: dict[str, ExpectedNot
             continue
         if stored.text != note.text:
             differences.append(f"{key}.text")
-        if (
-            stored.provenance is not None
-            and not isinstance(stored.provenance, Unreadable)
-            and stored.provenance != note.provenance
-        ):
+        if isinstance(stored.provenance, Unreadable):
+            if exact:
+                unreadable = stored.provenance
+        elif stored.provenance != note.provenance and (exact or stored.provenance is not None):
             differences.append(f"{key}.provenance")
-    return f"final storage differs from expected: {', '.join(differences)}" if differences else None
+    if differences:
+        return f"final storage differs from expected: {', '.join(differences)}"
+    if unreadable is not None:
+        raise _NotGradable(unreadable.reason)
+    return None
 
 
 def _provenance(note: StoredNote) -> Provenance | None:
@@ -238,12 +246,12 @@ def _boundary(context: _Context, *, trust_check: bool) -> str | None:
     return None
 
 
-def _seed(context: _Context, count: int) -> tuple[dict[str, str], list[str]]:
+def _seed(context: _Context, count: int, *, exact: bool = False) -> tuple[dict[str, str], list[str]]:
     successful: dict[str, str] = {}
     rejected: list[str] = []
     expected: dict[str, ExpectedNote] = {}
     context.expected_final = expected
-    context.postcondition = lambda after: _final_difference(after, expected)
+    context.postcondition = lambda after: _final_difference(after, expected, exact=exact)
     for index in range(count):
         key, text = f"note-{index:02d}", f"synthetic text {index:02d}"
         if context.adapter.write_note(key, text, provenance="agent"):
@@ -283,7 +291,7 @@ def _agreement(context: _Context, snapshot: StorageSnapshot, known: set[str]) ->
 
 
 def _restart_retention(context: _Context) -> str | None:
-    successful, rejected = _seed(context, 12)
+    successful, rejected = _seed(context, 12, exact=True)
     context.adapter.restart()
     snapshot = context.snapshot()
     if rejected:
@@ -292,7 +300,7 @@ def _restart_retention(context: _Context) -> str | None:
 
 
 def _delete_exactly_one(context: _Context) -> str | None:
-    successful, rejected = _seed(context, 12)
+    successful, rejected = _seed(context, 12, exact=True)
     assert context.expected_final is not None
     context.expected_final.pop("note-05", None)
     before = context.inspector.snapshot(context.storage_dir)
@@ -313,7 +321,7 @@ def _delete_exactly_one(context: _Context) -> str | None:
 
 
 def _burst(context: _Context) -> str | None:
-    successful, _ = _seed(context, 30)
+    successful, _ = _seed(context, 30, exact=True)
     failures: list[str] = []
     snapshots: list[StorageSnapshot | Unreadable] = []
     for _ in range(2):
