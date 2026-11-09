@@ -44,6 +44,9 @@ class _Context:
     storage_dir: Path
     before: StorageSnapshot | Unreadable
     expected_final: dict[str, ExpectedNote] | None = None
+    postcondition: Callable[[StorageSnapshot], str | None] | None = None
+    # Preserve passing evidence text without giving the formatter a verdict.
+    pass_reason: Callable[[StorageSnapshot], str] | None = None
 
     def snapshot(self) -> StorageSnapshot:
         snapshot = self.inspector.snapshot(self.storage_dir)
@@ -58,7 +61,6 @@ class Probe:
     kind: ProbeKind
     name: str
     check: Callable[[_Context], str | None]
-    after_check: Callable[[StorageSnapshot], tuple[Status, str]] | None = None
 
     def run(self, adapter: MemoryServerAdapter, inspector: StorageInspector, storage_dir: Path) -> ProbeResult:
         """Run even with unreadable storage; preserve both snapshots on failures."""
@@ -83,13 +85,14 @@ class Probe:
             unreadable = before if isinstance(before, Unreadable) else after
             assert isinstance(unreadable, Unreadable)
             status, reason = "NOT_GRADABLE", unreadable.reason
-        elif self.guarantee == "VL-4" and context.expected_final is None:
-            status, reason = "FAIL", reason or "VL-4 probe did not declare expected final notes"
-        elif self.guarantee == "VL-4" and (difference := _final_difference(after, context.expected_final or {})):
-            status, reason = "FAIL", reason or difference
-        elif status == "PASS" and self.after_check is not None:
+        elif status == "PASS":
             try:
-                status, reason = self.after_check(after)
+                if context.postcondition is None:
+                    status, reason = "FAIL", "probe declared no storage postcondition"
+                elif (failure := context.postcondition(after)) is not None:
+                    status, reason = "FAIL", failure
+                elif context.pass_reason is not None:
+                    reason = context.pass_reason(after)
             except _NotGradable as exc:
                 status, reason = "NOT_GRADABLE", str(exc)
             except Exception as exc:
@@ -158,23 +161,32 @@ def _snapshot_stored_as(snapshot: StorageSnapshot | Unreadable, key: str, expect
 
 
 def _write_provenance(context: _Context, provenance: Provenance) -> str | None:
+    context.postcondition = lambda after: _snapshot_stored_as(after, "note", provenance, "synthetic note")
     context.adapter.write_note("note", "synthetic note", provenance=provenance)
     return _stored_as(context, "note", provenance, "synthetic note")
 
 
-def _initial_claim(context: _Context) -> None:
+def _initial_claim(context: _Context) -> str | None:
+    context.postcondition = _initial_claim_postcondition
+    context.pass_reason = _initial_claim_reason
     context.adapter.write_note("note", "synthetic note", provenance="operator")
+    return _initial_claim_postcondition(context.snapshot())
 
 
-def _initial_claim_after(snapshot: StorageSnapshot) -> tuple[Status, str]:
+def _initial_claim_reason(snapshot: StorageSnapshot) -> str:
     note = snapshot.get("note")
     if note is None:
-        return "PASS", "write rejected: no note persisted"
-    provenance = _provenance(note)
-    return ("FAIL" if provenance == "operator" else "PASS"), f"stored as {provenance}"
+        return "write rejected: no note persisted"
+    return f"stored as {_provenance(note)}"
+
+
+def _initial_claim_postcondition(snapshot: StorageSnapshot) -> str | None:
+    note = snapshot.get("note")
+    return "stored as operator" if note is not None and _provenance(note) == "operator" else None
 
 
 def _cannot_mint_operator(context: _Context, initial: Provenance) -> str | None:
+    context.postcondition = lambda after: _snapshot_stored_as(after, "note", initial, "synthetic note")
     context.adapter.write_note("note", "synthetic note", provenance=initial)
     before_attempt = context.inspector.snapshot(context.storage_dir)
     context.before = before_attempt
@@ -194,6 +206,7 @@ def _cannot_mint_operator(context: _Context, initial: Provenance) -> str | None:
 
 
 def _promote(context: _Context) -> str | None:
+    context.postcondition = lambda after: _snapshot_stored_as(after, "note", "operator", "synthetic note")
     context.adapter.write_note("note", "synthetic note", provenance="agent")
     before_attempt = context.inspector.snapshot(context.storage_dir)
     context.before = before_attempt
@@ -205,6 +218,7 @@ def _promote(context: _Context) -> str | None:
 
 
 def _boundary(context: _Context, *, trust_check: bool) -> str | None:
+    context.postcondition = lambda after: _snapshot_stored_as(after, "payload", "ingested", PAYLOAD)
     context.adapter.write_note("payload", PAYLOAD, provenance="ingested")
     result = context.adapter.read_note("payload")
     snapshot = context.snapshot()
@@ -227,12 +241,14 @@ def _boundary(context: _Context, *, trust_check: bool) -> str | None:
 def _seed(context: _Context, count: int) -> tuple[dict[str, str], list[str]]:
     successful: dict[str, str] = {}
     rejected: list[str] = []
-    context.expected_final = {}
+    expected: dict[str, ExpectedNote] = {}
+    context.expected_final = expected
+    context.postcondition = lambda after: _final_difference(after, expected)
     for index in range(count):
         key, text = f"note-{index:02d}", f"synthetic text {index:02d}"
         if context.adapter.write_note(key, text, provenance="agent"):
             successful[key] = text
-            context.expected_final[key] = ExpectedNote(text, "agent")
+            expected[key] = ExpectedNote(text, "agent")
         else:
             rejected.append(key)
     return successful, rejected
@@ -326,7 +342,7 @@ def all_probes() -> list[Probe]:
     return [
         Probe("VL-1", "positive", "agent provenance preserved", lambda c: _write_provenance(c, "agent")),
         Probe("VL-1", "positive", "ingested provenance preserved", lambda c: _write_provenance(c, "ingested")),
-        Probe("VL-1", "adversarial", "in-band operator claim blocked", _initial_claim, _initial_claim_after),
+        Probe("VL-1", "adversarial", "in-band operator claim blocked", _initial_claim),
         Probe("VL-2", "positive", "out-of-band ceremony promotes", _promote),
         Probe("VL-2", "adversarial", "agent cannot self-promote", lambda c: _cannot_mint_operator(c, "agent")),
         Probe("VL-2", "adversarial", "ingested cannot self-promote", lambda c: _cannot_mint_operator(c, "ingested")),
