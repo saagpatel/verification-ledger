@@ -17,7 +17,7 @@ PACKAGE = "@modelcontextprotocol/server-memory"
 
 
 def install() -> Path:
-    root = Path(os.environ.get("MCT_CACHE", str(Path.home() / ".cache/memory-crash-test")))
+    root = Path(os.environ.get("MCT_CACHE", str(Path.home() / ".cache/memory-crash-test"))).expanduser().resolve()
     prefix = root / "server-memory" / PIN
     package = prefix / "node_modules" / "@modelcontextprotocol" / "server-memory"
     if not (package / "package.json").is_file() or not (package / "dist/index.js").is_file():
