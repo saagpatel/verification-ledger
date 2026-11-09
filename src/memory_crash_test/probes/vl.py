@@ -31,12 +31,19 @@ class _NotGradable(Exception):
     pass
 
 
+@dataclass(frozen=True)
+class ExpectedNote:
+    text: str
+    provenance: Provenance
+
+
 @dataclass
 class _Context:
     adapter: MemoryServerAdapter
     inspector: StorageInspector
     storage_dir: Path
     before: StorageSnapshot | Unreadable
+    expected_final: dict[str, ExpectedNote] | None = None
 
     def snapshot(self) -> StorageSnapshot:
         snapshot = self.inspector.snapshot(self.storage_dir)
@@ -76,6 +83,10 @@ class Probe:
             unreadable = before if isinstance(before, Unreadable) else after
             assert isinstance(unreadable, Unreadable)
             status, reason = "NOT_GRADABLE", unreadable.reason
+        elif self.guarantee == "VL-4" and context.expected_final is None:
+            status, reason = "FAIL", reason or "VL-4 probe did not declare expected final notes"
+        elif self.guarantee == "VL-4" and (difference := _final_difference(after, context.expected_final or {})):
+            status, reason = "FAIL", reason or difference
         elif status == "PASS" and self.after_check is not None:
             try:
                 status, reason = self.after_check(after)
@@ -100,6 +111,24 @@ def _take_snapshot(inspector: StorageInspector, storage_dir: Path) -> tuple[Stor
     except Exception as exc:
         reason = f"inspector raised {type(exc).__name__}: {exc}"
         return Unreadable(reason), reason
+
+
+def _final_difference(snapshot: StorageSnapshot, expected: dict[str, ExpectedNote]) -> str | None:
+    differences: list[str] = []
+    for key, note in sorted(expected.items()):
+        stored = snapshot.get(key)
+        if stored is None:
+            differences.append(key)
+            continue
+        if stored.text != note.text:
+            differences.append(f"{key}.text")
+        if (
+            stored.provenance is not None
+            and not isinstance(stored.provenance, Unreadable)
+            and stored.provenance != note.provenance
+        ):
+            differences.append(f"{key}.provenance")
+    return f"final storage differs from expected: {', '.join(differences)}" if differences else None
 
 
 def _provenance(note: StoredNote) -> Provenance | None:
@@ -198,10 +227,12 @@ def _boundary(context: _Context, *, trust_check: bool) -> str | None:
 def _seed(context: _Context, count: int) -> tuple[dict[str, str], list[str]]:
     successful: dict[str, str] = {}
     rejected: list[str] = []
+    context.expected_final = {}
     for index in range(count):
         key, text = f"note-{index:02d}", f"synthetic text {index:02d}"
         if context.adapter.write_note(key, text, provenance="agent"):
             successful[key] = text
+            context.expected_final[key] = ExpectedNote(text, "agent")
         else:
             rejected.append(key)
     return successful, rejected
@@ -217,19 +248,24 @@ def _retained(snapshot: StorageSnapshot, expected: dict[str, str]) -> str | None
 
 
 def _agreement(context: _Context, snapshot: StorageSnapshot, known: set[str]) -> str | None:
+    failure: str | None = None
     listed = context.adapter.list_keys()
     if len(listed) != len(set(listed)):
-        return "server list contains duplicate keys"
-    if set(listed) != set(snapshot):
-        return f"server list disagrees with persisted storage keys: {sorted(set(listed) ^ set(snapshot))}"
+        failure = "server list contains duplicate keys"
+    elif set(listed) != set(snapshot):
+        failure = f"server list disagrees with persisted storage keys: {sorted(set(listed) ^ set(snapshot))}"
     for key in sorted(set(snapshot) | set(listed) | known | {"never-written"}):
         result = context.adapter.read_note(key)
         note = snapshot.get(key)
         if note is None and result is not None:
-            return f"server returns {key}, which is absent from persisted storage"
+            failure = failure or f"server returns {key}, which is absent from persisted storage"
         if note is not None and (result is None or result.text != note.text):
-            return f"server omits or misreports persisted note {key}"
-    return None
+            failure = failure or f"server omits or misreports persisted note {key}"
+    after_reads = context.snapshot()
+    changed = sorted(key for key in set(snapshot) | set(after_reads) if snapshot.get(key) != after_reads.get(key))
+    if changed:
+        return f"reads changed persisted storage: {changed}"
+    return failure
 
 
 def _restart_retention(context: _Context) -> str | None:
@@ -243,6 +279,8 @@ def _restart_retention(context: _Context) -> str | None:
 
 def _delete_exactly_one(context: _Context) -> str | None:
     successful, rejected = _seed(context, 12)
+    assert context.expected_final is not None
+    context.expected_final.pop("note-05", None)
     before = context.inspector.snapshot(context.storage_dir)
     context.before = before
     context.adapter.delete_note("note-05")
