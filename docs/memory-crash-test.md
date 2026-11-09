@@ -79,7 +79,8 @@ should inspect statuses, rather than infer a pass from the CLI's exit status:
 exit zero means that the report was written, even for FAIL/NOT_GRADABLE grades.
 
 The schema below describes emitted reports. Snapshot `notes` maps adapter keys
-to the persisted note. `null` and `{"unreadable": "reason"}` are deliberately
+to the persisted note. Graph inspectors may also include a `relations` array in
+the snapshot as separate evidence; relation rows are not note keys. `null` and `{"unreadable": "reason"}` are deliberately
 different values. No temporary storage path or process ID is serialized.
 
 ```json
@@ -136,7 +137,8 @@ different values. No temporary storage path or process ID is serialized.
           "type": "object", "required": ["notes"],
           "additionalProperties": false,
           "properties": {
-            "notes": {"type": "object", "additionalProperties": {"$ref": "#/$defs/note"}}
+            "notes": {"type": "object", "additionalProperties": {"$ref": "#/$defs/note"}},
+            "relations": {"type": "array", "items": {"type": "object", "additionalProperties": {"type": "string"}}}
           }
         }
       ]

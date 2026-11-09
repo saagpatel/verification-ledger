@@ -10,6 +10,7 @@ from concurrent.futures import Future
 from contextlib import AbstractContextManager
 from functools import partial
 from typing import cast
+from pathlib import Path
 
 import anyio
 from anyio.abc import TaskStatus
@@ -20,11 +21,11 @@ from mcp.types import CallToolResult
 
 
 class MCPClient:
-    def __init__(self, command: str, args: list[str], *, timeout: float = 20) -> None:
+    def __init__(self, command: str, args: list[str], *, timeout: float = 20, env: dict[str, str] | None = None, cwd: Path | None = None) -> None:
         if timeout <= 0:
             raise ValueError("timeout must be positive")
         self.timeout = timeout
-        self._parameters = StdioServerParameters(command=command, args=args)
+        self._parameters = StdioServerParameters(command=command, args=args, env=env, cwd=cwd)
         self._context: AbstractContextManager[BlockingPortal] = start_blocking_portal()
         self._portal = self._context.__enter__()
         self._stop: anyio.Event | None = None
