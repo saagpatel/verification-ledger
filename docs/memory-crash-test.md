@@ -27,7 +27,12 @@ key. It cannot discover an unenumerated phantom identity outside that finite set
 After every VL-4 read pass, storage is re-inspected and must have exactly the
 same keys, text, and provenance as before the listing and reads. Every VL-4
 probe's final `after` snapshot must contain every successfully written note it
-expects to retain, excluding only the targeted note in the deletion probe.
+expects to retain with equal text and readable provenance as written, excluding
+only the targeted note in the deletion probe. Missing keys and changed fields
+fail with a list such as `final storage differs from expected: note-03.text`.
+Provenance reported as `null` or `Unreadable` is skipped by this final comparison;
+keys and text are still checked. Unexpected extra keys do not fail this backstop
+(other checks judge those), and a VL-4 probe without a declared expectation fails.
 Restarts are graceful process stop/start operations; this packet does not claim
 power-loss, forced-kill, concurrent-writer, or filesystem durability coverage.
 

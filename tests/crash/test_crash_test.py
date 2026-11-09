@@ -122,6 +122,8 @@ def test_unreadable_provenance_is_not_gradable_for_vl1(tmp_path: Path) -> None:
     vl3 = next(item for item in grade.guarantees if item.guarantee == "VL-3")
     assert vl3.probes[0].status == "PASS"
     assert vl3.probes[1].status == "NOT_GRADABLE"
+    vl4 = next(item for item in grade.guarantees if item.guarantee == "VL-4")
+    assert vl4.status == "PASS"
     assert ServerGrade.from_json(grade.to_json()) == grade
 
 
@@ -337,26 +339,69 @@ def test_vl4_rejects_destructive_listing_even_with_cached_reads(tmp_path: Path) 
 
 
 @pytest.mark.parametrize("probe_name", [probe.name for probe in all_probes() if probe.guarantee == "VL-4"])
-def test_vl4_final_snapshot_catches_loss_after_check(tmp_path: Path, probe_name: str) -> None:
+@pytest.mark.parametrize("mutation", ["delete", "text", "provenance"])
+def test_vl4_final_snapshot_catches_corruption_after_check(
+    tmp_path: Path, probe_name: str, mutation: Literal["delete", "text", "provenance"],
+) -> None:
     adapter = _RetentionAdapter()
     probe = next(probe for probe in all_probes() if probe.name == probe_name)
 
-    def lose_note() -> None:
-        del adapter.notes["note-03"]
+    def corrupt_note() -> None:
+        note = adapter.notes["note-03"]
+        if mutation == "delete":
+            del adapter.notes["note-03"]
+        elif mutation == "text":
+            adapter.notes["note-03"] = replace(note, text="CORRUPTED")
+        else:
+            adapter.notes["note-03"] = replace(note, provenance="operator")
 
-    # Simulate loss after the entire original check (including read re-inspection).
-    late_loss = Probe(
+    # Simulate corruption after the entire original check (including read re-inspection).
+    late_corruption = Probe(
         probe.guarantee, probe.kind, probe.name,
-        lambda context: probe.check(context) or lose_note(),
+        lambda context: probe.check(context) or corrupt_note(),
     )
     adapter.start(tmp_path)
     try:
-        result = late_loss.run(adapter, _DoubleInspector(adapter), tmp_path)
+        result = late_corruption.run(adapter, _DoubleInspector(adapter), tmp_path)
     finally:
         adapter.stop()
     assert result.status == "FAIL"
-    assert result.reason == "final storage is missing expected notes: ['note-03']"
-    assert isinstance(result.after, dict) and "note-03" not in result.after
+    field = "" if mutation == "delete" else f".{mutation}"
+    assert result.reason == f"final storage differs from expected: note-03{field}"
+    assert isinstance(result.after, dict)
+    if mutation == "delete":
+        assert "note-03" not in result.after
+    elif mutation == "text":
+        assert result.after["note-03"].text == "CORRUPTED"
+    else:
+        assert result.after["note-03"].provenance == "operator"
+
+
+@pytest.mark.parametrize("provenance", [None, Unreadable("provenance unavailable")])
+@pytest.mark.parametrize("corrupt_text", [False, True])
+def test_vl4_final_snapshot_checks_text_with_unassessable_provenance(
+    tmp_path: Path, provenance: None | Unreadable, corrupt_text: bool,
+) -> None:
+    adapter = _RetentionAdapter()
+    probe = next(probe for probe in all_probes() if probe.guarantee == "VL-4")
+
+    def change_note() -> None:
+        note = adapter.notes["note-03"]
+        adapter.notes["note-03"] = replace(
+            note, provenance=provenance, text="CORRUPTED" if corrupt_text else note.text,
+        )
+
+    late_change = Probe(
+        probe.guarantee, probe.kind, probe.name,
+        lambda context: probe.check(context) or change_note(),
+    )
+    adapter.start(tmp_path)
+    try:
+        result = late_change.run(adapter, _DoubleInspector(adapter), tmp_path)
+    finally:
+        adapter.stop()
+    assert result.status == ("FAIL" if corrupt_text else "PASS")
+    assert result.reason == ("final storage differs from expected: note-03.text" if corrupt_text else "")
 
 
 def _double_grade(mode: Mode, tmp_path: Path) -> ServerGrade:
