@@ -1,0 +1,3 @@
+{"type":"entity","name":"alpha","entityType":"agent","observations":["hello"]}
+{"type":"entity","name":"beta","entityType":"ingested","observations":["world"]}
+{"type":"relation","from":"alpha","to":"beta","relationType":"references"}

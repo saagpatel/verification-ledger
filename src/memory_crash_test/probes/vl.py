@@ -274,8 +274,10 @@ def _retained(snapshot: StorageSnapshot, expected: dict[str, str]) -> str | None
 def _agreement(context: _Context, snapshot: StorageSnapshot, known: set[str]) -> str | None:
     failure: str | None = None
     listed = context.adapter.list_keys()
-    if len(listed) != len(set(listed)) or set(listed) != set(snapshot):
-        failure = "server list results disagree with persisted storage keys"
+    if len(listed) != len(set(listed)):
+        failure = "server list contains duplicate keys"
+    elif set(listed) != set(snapshot):
+        failure = f"server list disagrees with persisted storage keys: {sorted(set(listed) ^ set(snapshot))}"
     for key in sorted(set(snapshot) | set(listed) | known | {"never-written"}):
         result = context.adapter.read_note(key)
         note = snapshot.get(key)
@@ -316,7 +318,8 @@ def _delete_exactly_one(context: _Context) -> str | None:
         return failure
     expected = {key: note for key, note in before.items() if key != "note-05"}
     if after != expected:
-        return "delete did not remove exactly the target while preserving every other stored note"
+        changed = sorted(key for key in set(expected) | set(after) if expected.get(key) != after.get(key))
+        return f"delete did not preserve expected stored notes: {changed}"
     return _agreement(context, after, set(successful))
 
 

@@ -722,3 +722,34 @@ def test_mcp_tool_timeout_terminates_child(tmp_path: Path) -> None:
     pid = int(pid_file.read_text())
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)
+
+
+@pytest.mark.parametrize("shutdown_timeout", [1.0, 0.01])
+def test_mcp_native_drain_and_forced_shutdown_evidence(tmp_path: Path, shutdown_timeout: float) -> None:
+    script = tmp_path / "draining_server.py"
+    marker = tmp_path / "drained"
+    script.write_text(
+        "from contextlib import asynccontextmanager\n"
+        "import anyio, pathlib, sys\n"
+        "from mcp.server.fastmcp import FastMCP\n"
+        "@asynccontextmanager\n"
+        "async def lifespan(server):\n"
+        "    try:\n"
+        "        yield {}\n"
+        "    finally:\n"
+        "        await anyio.sleep(0.2)\n"
+        "        pathlib.Path(sys.argv[1]).write_text('native drain finished')\n"
+        "server = FastMCP('drain-test', lifespan=lifespan)\n"
+        "server.run(transport='stdio')\n",
+        encoding="utf-8",
+    )
+    client = MCPClient(
+        sys.executable, [str(script), str(marker)], shutdown_timeout=shutdown_timeout,
+    )
+    if shutdown_timeout < 0.2:
+        with pytest.raises(TimeoutError, match="native drain; forced termination"):
+            client.close()
+        assert not marker.exists()
+    else:
+        client.close()
+        assert marker.read_text() == "native drain finished"

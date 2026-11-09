@@ -21,7 +21,30 @@ class StoredNote:
     provenance: Provenance | None | Unreadable
 
 
+class GraphSnapshot(dict[str, StoredNote]):
+    """Note identities with separately recorded native graph edges."""
+
+    def __init__(
+        self,
+        notes: dict[str, StoredNote],
+        relations: list[dict[str, str]],
+        *,
+        evidence: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__(notes)
+        self.relations = relations
+        self.evidence = evidence
+
+
 type StorageSnapshot = dict[str, StoredNote]
+
+
+class EvidenceSnapshot(dict[str, StoredNote]):
+    """Optional secondary evidence; dict equality still compares only notes."""
+
+    def __init__(self, *, evidence: dict[str, object]) -> None:
+        super().__init__()
+        self.evidence = evidence
 
 
 class StorageInspector(Protocol):
