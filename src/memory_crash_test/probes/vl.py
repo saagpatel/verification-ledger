@@ -37,6 +37,7 @@ class _Context:
     inspector: StorageInspector
     storage_dir: Path
     before: StorageSnapshot | Unreadable
+    expected_final_keys: set[str] | None = None
 
     def snapshot(self) -> StorageSnapshot:
         snapshot = self.inspector.snapshot(self.storage_dir)
@@ -76,6 +77,10 @@ class Probe:
             unreadable = before if isinstance(before, Unreadable) else after
             assert isinstance(unreadable, Unreadable)
             status, reason = "NOT_GRADABLE", unreadable.reason
+        elif self.guarantee == "VL-4" and context.expected_final_keys is None:
+            status, reason = "FAIL", reason or "VL-4 probe did not declare expected final keys"
+        elif self.guarantee == "VL-4" and (missing := sorted((context.expected_final_keys or set()) - set(after))):
+            status, reason = "FAIL", reason or f"final storage is missing expected notes: {missing}"
         elif status == "PASS" and self.after_check is not None:
             try:
                 status, reason = self.after_check(after)
@@ -198,10 +203,12 @@ def _boundary(context: _Context, *, trust_check: bool) -> str | None:
 def _seed(context: _Context, count: int) -> tuple[dict[str, str], list[str]]:
     successful: dict[str, str] = {}
     rejected: list[str] = []
+    context.expected_final_keys = set()
     for index in range(count):
         key, text = f"note-{index:02d}", f"synthetic text {index:02d}"
         if context.adapter.write_note(key, text, provenance="agent"):
             successful[key] = text
+            context.expected_final_keys.add(key)
         else:
             rejected.append(key)
     return successful, rejected
@@ -217,17 +224,22 @@ def _retained(snapshot: StorageSnapshot, expected: dict[str, str]) -> str | None
 
 
 def _agreement(context: _Context, snapshot: StorageSnapshot, known: set[str]) -> str | None:
+    failure: str | None = None
     listed = context.adapter.list_keys()
     if len(listed) != len(set(listed)) or set(listed) != set(snapshot):
-        return "server list results disagree with persisted storage keys"
+        failure = "server list results disagree with persisted storage keys"
     for key in sorted(set(snapshot) | set(listed) | known | {"never-written"}):
         result = context.adapter.read_note(key)
         note = snapshot.get(key)
         if note is None and result is not None:
-            return f"server returns {key}, which is absent from persisted storage"
+            failure = failure or f"server returns {key}, which is absent from persisted storage"
         if note is not None and (result is None or result.text != note.text):
-            return f"server omits or misreports persisted note {key}"
-    return None
+            failure = failure or f"server omits or misreports persisted note {key}"
+    after_reads = context.snapshot()
+    changed = sorted(key for key in set(snapshot) | set(after_reads) if snapshot.get(key) != after_reads.get(key))
+    if changed:
+        return f"reads changed persisted storage: {changed}"
+    return failure
 
 
 def _restart_retention(context: _Context) -> str | None:
@@ -241,6 +253,8 @@ def _restart_retention(context: _Context) -> str | None:
 
 def _delete_exactly_one(context: _Context) -> str | None:
     successful, rejected = _seed(context, 12)
+    assert context.expected_final_keys is not None
+    context.expected_final_keys.discard("note-05")
     before = context.inspector.snapshot(context.storage_dir)
     context.before = before
     context.adapter.delete_note("note-05")

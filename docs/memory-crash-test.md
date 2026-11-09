@@ -24,6 +24,10 @@ success. The 12-note positive probe requires all 12 writes to report success.
 Read consistency compares exact key sets (including duplicate-list detection),
 the text of every persisted or listed key, all generated keys, and a never-written
 key. It cannot discover an unenumerated phantom identity outside that finite set.
+After every VL-4 read pass, storage is re-inspected and must have exactly the
+same keys, text, and provenance as before the listing and reads. Every VL-4
+probe's final `after` snapshot must contain every successfully written note it
+expects to retain, excluding only the targeted note in the deletion probe.
 Restarts are graceful process stop/start operations; this packet does not claim
 power-loss, forced-kill, concurrent-writer, or filesystem durability coverage.
 

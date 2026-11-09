@@ -1,6 +1,7 @@
 """Tests for the memory-server contract, probes, and local reference fixture."""
 
 import os
+from dataclasses import replace
 from pathlib import Path
 import json
 import sys
@@ -26,7 +27,7 @@ from memory_crash_test.inspect.base import (
     StoredNote,
     Unreadable,
 )
-from memory_crash_test.probes.vl import GUARANTEES, ProbeResult, all_probes
+from memory_crash_test.probes.vl import GUARANTEES, Probe, ProbeResult, all_probes
 
 
 @pytest.fixture(scope="module")
@@ -259,6 +260,103 @@ class _DoubleInspector:
 
     def snapshot(self, storage_dir: Path) -> StorageSnapshot:
         return dict(self.adapter.notes)
+
+
+class _RetentionAdapter(_DoubleAdapter):
+    def __init__(self) -> None:
+        super().__init__("allow")
+
+    def read_note(self, key: str) -> ReadResult | None:
+        note = self.notes.get(key)
+        return None if note is None else ReadResult(note.text, None, note.text)
+
+
+class _MutatingReadAdapter(_RetentionAdapter):
+    def __init__(self, mutation: Literal["delete", "text", "provenance"]) -> None:
+        super().__init__()
+        self.mutation = mutation
+
+    def read_note(self, key: str) -> ReadResult | None:
+        result = super().read_note(key)
+        if key == "note-03":
+            note = self.notes[key]
+            if self.mutation == "delete":
+                del self.notes[key]
+            elif self.mutation == "text":
+                self.notes[key] = replace(note, text="changed during read")
+            else:
+                self.notes[key] = replace(note, provenance="operator")
+        return result
+
+
+class _DestructiveListAdapter(_RetentionAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.removed: StoredNote | None = None
+
+    def list_keys(self) -> list[str]:
+        keys = super().list_keys()
+        self.removed = self.notes.pop("note-03")
+        return keys
+
+    def read_note(self, key: str) -> ReadResult | None:
+        if self.removed is not None and key == self.removed.key:
+            return ReadResult(self.removed.text, None, self.removed.text)
+        return super().read_note(key)
+
+
+@pytest.mark.parametrize("mutation", ["delete", "text", "provenance"])
+def test_vl4_rejects_reads_that_change_storage(
+    tmp_path: Path, mutation: Literal["delete", "text", "provenance"],
+) -> None:
+    adapter = _MutatingReadAdapter(mutation)
+    grade = grade_server(lambda: adapter, _DoubleInspector(adapter), temp_root=tmp_path)
+    vl4 = next(item for item in grade.guarantees if item.guarantee == "VL-4")
+    assert vl4.status == "FAIL"
+    for probe in vl4.probes:
+        if "burst" in probe.name:
+            assert probe.status == "PASS"  # The burst performs no reads.
+        else:
+            assert probe.status == "FAIL"
+            assert probe.reason == "reads changed persisted storage: ['note-03']"
+            assert isinstance(probe.after, dict)
+            if mutation == "delete":
+                assert "note-03" not in probe.after
+
+
+def test_vl4_rejects_destructive_listing_even_with_cached_reads(tmp_path: Path) -> None:
+    adapter = _DestructiveListAdapter()
+    grade = grade_server(lambda: adapter, _DoubleInspector(adapter), temp_root=tmp_path)
+    vl4 = next(item for item in grade.guarantees if item.guarantee == "VL-4")
+    assert vl4.status == "FAIL"
+    for probe in vl4.probes:
+        if "burst" not in probe.name:
+            assert probe.status == "FAIL"
+            assert probe.reason == "reads changed persisted storage: ['note-03']"
+            assert isinstance(probe.after, dict) and "note-03" not in probe.after
+
+
+@pytest.mark.parametrize("probe_name", [probe.name for probe in all_probes() if probe.guarantee == "VL-4"])
+def test_vl4_final_snapshot_catches_loss_after_check(tmp_path: Path, probe_name: str) -> None:
+    adapter = _RetentionAdapter()
+    probe = next(probe for probe in all_probes() if probe.name == probe_name)
+
+    def lose_note() -> None:
+        del adapter.notes["note-03"]
+
+    # Simulate loss after the entire original check (including read re-inspection).
+    late_loss = Probe(
+        probe.guarantee, probe.kind, probe.name,
+        lambda context: probe.check(context) or lose_note(),
+    )
+    adapter.start(tmp_path)
+    try:
+        result = late_loss.run(adapter, _DoubleInspector(adapter), tmp_path)
+    finally:
+        adapter.stop()
+    assert result.status == "FAIL"
+    assert result.reason == "final storage is missing expected notes: ['note-03']"
+    assert isinstance(result.after, dict) and "note-03" not in result.after
 
 
 def _double_grade(mode: Mode, tmp_path: Path) -> ServerGrade:
