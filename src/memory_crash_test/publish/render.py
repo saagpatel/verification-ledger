@@ -10,7 +10,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from memory_crash_test.adapters.base import ServerRelease
-from memory_crash_test.grade.grader import GuaranteeGrade, ServerGrade
+from memory_crash_test.grade.grader import GuaranteeGrade, ServerGrade, snapshot_json
 from memory_crash_test.inspect.base import Provenance, StorageSnapshot, Unreadable
 from memory_crash_test.probes.vl import ProbeResult
 from memory_crash_test.servers import SERVERS
@@ -202,16 +202,23 @@ def write_cards(grades: Sequence[ServerGrade], out: Path) -> None:
                 f"{grade.release.name} {grade.release.version}"
             )
         planned[href] = grade
-    out.mkdir(parents=True, exist_ok=True)
     root = out.resolve()
-    for href, grade in planned.items():
-        destination = (out / href).resolve()
+    destinations: dict[str, Path] = {}
+    for href in [*planned, "index.html"]:
+        path = out / href
+        if path.is_symlink():
+            raise ValueError(f"output destination is a symlink: {href}")
+        destination = path.resolve()
         if not destination.is_relative_to(root):
-            raise ValueError(f"card path escapes the output directory: {href}")
+            raise ValueError(f"output path escapes the output directory: {href}")
+        destinations[href] = destination
+    for href, grade in planned.items():
+        destination = destinations[href]
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(render_card(grade), encoding="utf-8")
     index_grades = list(planned.values())
-    (out / "index.html").write_text(render_index(index_grades), encoding="utf-8")
+    root.mkdir(parents=True, exist_ok=True)
+    destinations["index.html"].write_text(render_index(index_grades), encoding="utf-8")
 
 
 def _document(title: str, body: str) -> str:
@@ -366,25 +373,17 @@ def _diff_text(before: StorageSnapshot | Unreadable, after: StorageSnapshot | Un
             f"{key} provenance: {_provenance_text(before[key].provenance)} → "
             f"{_provenance_text(after[key].provenance)}"
         )
+    before_data, after_data = snapshot_json(before), snapshot_json(after)
+    for field in ("relations", "evidence"):
+        if before_data.get(field) != after_data.get(field):
+            for label, data in (("before", before_data), ("after", after_data)):
+                value = json.dumps(data.get(field), sort_keys=True, ensure_ascii=False)
+                lines.append(f"{field} {label}: {value}")
     return "\n".join(lines)
 
 
 def _snapshot_text(snapshot: StorageSnapshot | Unreadable) -> str:
-    return json.dumps(_snapshot_data(snapshot), indent=2, sort_keys=True, ensure_ascii=False)
-
-
-def _snapshot_data(snapshot: StorageSnapshot | Unreadable) -> dict[str, object]:
-    if isinstance(snapshot, Unreadable):
-        return {"unreadable": snapshot.reason}
-    notes: dict[str, object] = {}
-    for key, note in snapshot.items():
-        provenance: object
-        if isinstance(note.provenance, Unreadable):
-            provenance = {"unreadable": note.provenance.reason}
-        else:
-            provenance = note.provenance
-        notes[key] = {"key": note.key, "text": note.text, "provenance": provenance}
-    return {"notes": notes}
+    return json.dumps(snapshot_json(snapshot), indent=2, sort_keys=True, ensure_ascii=False)
 
 
 def _provenance_text(provenance: Provenance | None | Unreadable) -> str:
@@ -402,9 +401,9 @@ def _reproduce_command(grade: ServerGrade) -> str:
 
 def _cli_server_name(release: ServerRelease) -> str:
     matches = [
-        name
-        for name, binding in SERVERS.items()
-        if binding.adapter_factory().release == release
+        binding.registry_key
+        for binding in SERVERS.values()
+        if binding.name == release.name and binding.source == release.source
     ]
     if len(matches) == 1:
         return matches[0]
