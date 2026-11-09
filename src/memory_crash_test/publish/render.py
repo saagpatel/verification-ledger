@@ -205,12 +205,16 @@ def write_cards(grades: Sequence[ServerGrade], out: Path) -> None:
     root = out.resolve()
     destinations: dict[str, Path] = {}
     for href in [*planned, "index.html"]:
-        path = out / href
-        if path.is_symlink():
-            raise ValueError(f"output destination is a symlink: {href}")
+        path = root
+        for part in Path(href).parts:
+            path = path / part
+            if path.is_symlink():
+                raise ValueError(f"output path contains a symlink: {href}")
         destination = path.resolve()
         if not destination.is_relative_to(root):
             raise ValueError(f"output path escapes the output directory: {href}")
+        if destination in destinations.values():
+            raise ValueError(f"multiple grades or index write {href}: {destination}")
         destinations[href] = destination
     for href, grade in planned.items():
         destination = destinations[href]
@@ -259,11 +263,25 @@ def _footer(grade: ServerGrade) -> str:
         response = "Maintainer response: not yet requested"
     else:
         response = f"Maintainer response: {grade.maintainer_response}"
+    command = _reproduce_command(grade)
+    if command is None:
+        release = grade.release
+        pins = sorted({
+            binding.version for binding in SERVERS.values()
+            if binding.name == release.name and binding.source == release.source
+        })
+        current = ", ".join(pins) if pins else "none"
+        reproduction = (
+            "<p>Reproduction with this suite's current pins is unavailable: "
+            f"this card records {_esc(release.name)} {_esc(release.version)}; "
+            f"the suite currently pins {_esc(current)}.</p>"
+        )
+    else:
+        reproduction = f"<p>Rerun this grade locally:</p>\n<pre>{_esc(command)}</pre>"
     return "\n".join([
         '<footer class="footer">',
         "<h2>Reproduce and respond</h2>",
-        "<p>Rerun this grade locally:</p>",
-        f"<pre>{_esc(_reproduce_command(grade))}</pre>",
+        reproduction,
         "<p>Every grade is pinned to the release shown and was produced only against "
         "a local instance on generated test data.</p>",
         f"<p>{_esc(response)}</p>",
@@ -394,20 +412,16 @@ def _provenance_text(provenance: Provenance | None | Unreadable) -> str:
     return provenance
 
 
-def _reproduce_command(grade: ServerGrade) -> str:
-    server = shlex.quote(_cli_server_name(grade.release))
-    return f"python -m memory_crash_test grade --server {server} --out ./result"
-
-
-def _cli_server_name(release: ServerRelease) -> str:
+def _reproduce_command(grade: ServerGrade) -> str | None:
+    release: ServerRelease = grade.release
     matches = [
         binding.registry_key
         for binding in SERVERS.values()
-        if binding.name == release.name and binding.source == release.source
+        if binding.name == release.name and binding.source == release.source and binding.version == release.version
     ]
     if len(matches) == 1:
-        return matches[0]
-    return release.name
+        return f"python -m memory_crash_test grade --server {shlex.quote(matches[0])} --out ./result"
+    return None
 
 
 def _card_href(grade: ServerGrade) -> str:

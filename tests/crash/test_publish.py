@@ -152,7 +152,8 @@ def test_card_renders_release_ratings_diff_and_reproduce_command() -> None:
     assert "write_note" in html
     assert "positive" in html and "adversarial" in html
     assert html.count("<details") == 4
-    assert "python -m memory_crash_test grade --server widget --out ./result" in html
+    assert "Reproduction with this suite's current pins is unavailable: this card records widget 1.2.3; the suite currently pins none." in html
+    assert "--server" not in html
     assert "Every grade is pinned to the release shown and was produced only against a local instance on generated test data." in html
     assert "Maintainer response: not yet requested" in html
     assert "Reproduce and respond" in html
@@ -218,6 +219,16 @@ def test_registered_release_uses_the_registry_name() -> None:
     assert "memory-crash-test-reference, version 1.0.0, source fixture" in html
 
 
+def test_reproduction_requires_the_exact_pinned_version() -> None:
+    name = "@modelcontextprotocol/server-memory"
+    old = render_card(_grade(ServerRelease(name, "2.0.0", "npm")))
+    assert "--server" not in old
+    assert ("Reproduction with this suite's current pins is unavailable: this card records "
+            "@modelcontextprotocol/server-memory 2.0.0; the suite currently pins 2.1.0.") in old
+    current = render_card(_grade(ServerRelease(name, "2.1.0", "npm")))
+    assert "--server server-memory --out ./result" in current
+
+
 @pytest.mark.parametrize(("release", "server"), [
     (ServerRelease("memory-crash-test-reference", "1.0.0", "fixture"), "reference"),
     (ServerRelease("@modelcontextprotocol/server-memory", "2.1.0", "npm"), "server-memory"),
@@ -275,8 +286,8 @@ def test_publish_preserves_full_snapshots_and_evidence_diff(tmp_path: Path, grap
     assert main(["publish", "--grades", str(source), "--out", str(out)]) == 0
     rendered = (out / "widget/1.2.3/index.html").read_text(encoding="utf-8")
     blocks = [unescape(block) for block in re.findall(r"<pre>(.*?)</pre>", rendered, re.DOTALL)]
-    assert json.loads(blocks[1]) == snapshot_json(before)
-    assert json.loads(blocks[2]) == snapshot_json(after)
+    assert json.loads(blocks[-2]) == snapshot_json(before)
+    assert json.loads(blocks[-1]) == snapshot_json(after)
     assert f"evidence before: {json.dumps(before_evidence, sort_keys=True)}" in blocks[0]
     assert f"evidence after: {json.dumps(after_evidence, sort_keys=True)}" in blocks[0]
     assert "<script>" not in rendered
@@ -322,6 +333,24 @@ def test_publish_refuses_slug_collisions(tmp_path: Path) -> None:
     out = tmp_path / "out"
     assert main(["publish", "--grades", str(first), str(second), "--out", str(out)]) == 1
     assert not (out / "index.html").exists()
+
+
+@pytest.mark.parametrize("alias", ["index", "card"])
+def test_publish_refuses_aliased_destinations_before_writing(tmp_path: Path, alias: str) -> None:
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    first.write_text(_grade().to_json(), encoding="utf-8")
+    second.write_text(_grade(ServerRelease("other", "1.2.3", "lab")).to_json(), encoding="utf-8")
+    out = tmp_path / "out"
+    (out / "widget").mkdir(parents=True)
+    if alias == "index":
+        (out / "widget/1.2.3").symlink_to(out, target_is_directory=True)
+    else:
+        (out / "other/1.2.3").mkdir(parents=True)
+        (out / "widget/1.2.3").symlink_to(out / "other/1.2.3", target_is_directory=True)
+    original_paths = set(out.rglob("*"))
+    assert main(["publish", "--grades", str(first), str(second), "--out", str(out)]) == 1
+    assert set(out.rglob("*")) == original_paths
 
 
 @pytest.mark.parametrize("destination", ["index-external", "index-internal", "card-external", "card-internal", "parent-external"])
