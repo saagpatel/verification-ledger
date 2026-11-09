@@ -77,6 +77,13 @@ VL-1 through VL-4 order; probes remain in suite execution order. Publishers
 should inspect statuses, rather than infer a pass from the CLI's exit status:
 exit zero means that the report was written, even for FAIL/NOT_GRADABLE grades.
 
+`maintainer_response` is optional. `to_json()` omits it when
+`ServerGrade.maintainer_response` is `None`, and `from_json()` defaults a
+missing key to `None`, so reports written before the field still round-trip.
+When the key is present its value is a string: the maintainer's reply. The
+grade card says "Maintainer response: not yet requested" when the field is
+absent.
+
 The schema below describes emitted reports. Snapshot `notes` maps adapter keys
 to the persisted note. `null` and `{"unreadable": "reason"}` are deliberately
 different values. No temporary storage path or process ID is serialized.
@@ -101,6 +108,7 @@ different values. No temporary storage path or process ID is serialized.
     },
     "run_at_utc": {"type": "string", "format": "date-time"},
     "suite_version": {"const": "1.0.0"},
+    "maintainer_response": {"type": "string"},
     "guarantees": {
       "type": "array", "minItems": 4, "maxItems": 4,
       "items": {"$ref": "#/$defs/guaranteeGrade"}
@@ -175,6 +183,24 @@ different values. No temporary storage path or process ID is serialized.
   }
 }
 ```
+
+## Grade cards
+
+`python -m memory_crash_test publish --grades <path...> --out <dir>` reads each
+file argument as one grade report. Each directory argument contributes every
+nested `grade.json`. One self-contained card is written to
+`<out>/<server-slug>/<version>/index.html`, plus an index at `<out>/index.html`.
+A slug lowercases the release name or version and collapses every run of
+characters outside `a-z`, `0-9`, `.`, `_`, and `-` to a single hyphen.
+
+Cards use inline CSS, system fonts, and `prefers-color-scheme` for light and
+dark. They load no external assets. Stored note text, probe reasons, call
+arguments, and maintainer replies are escaped, including the VL-3
+instruction-like payload. The footer command is
+`python -m memory_crash_test grade --server <name> --out ./result`. `<name>` is
+the registry key when the graded release matches exactly one entry in
+`servers.SERVERS`; otherwise it is the release name. Rendered trees named
+`out/` or `cards/` are gitignored and are not source.
 
 ## Local test safety
 
