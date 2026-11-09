@@ -1,7 +1,8 @@
 """Markdown is authoritative for text and note existence.
 
 Reported provenance is the most privileged value across the Markdown frontmatter
-and the latest accepted SQLite revision. Disagreements stay in the evidence.
+and the latest accepted SQLite revision, only when both are readable.
+Disagreements stay in the evidence.
 """
 
 import hashlib
@@ -52,7 +53,11 @@ def _more_privileged(
     markdown_trust: Provenance | None | Unreadable,
     accepted_trust: Provenance | None | Unreadable,
 ) -> Provenance | None | Unreadable:
-    """operator outranks agent, which outranks ingested. Absence is lowest."""
+    """Unreadable wins; otherwise operator > agent > ingested > absence."""
+    if isinstance(accepted_trust, Unreadable):
+        return accepted_trust
+    if isinstance(markdown_trust, Unreadable):
+        return markdown_trust
     if _privilege(accepted_trust) > _privilege(markdown_trust):
         return accepted_trust
     return markdown_trust
@@ -122,14 +127,18 @@ class BasicMemoryInspector:
         storage_dir: Path, markdown: dict[str, str], notes: EvidenceSnapshot,
     ) -> dict[str, object]:
         database = storage_dir / "config/memory.db"
-        if not database.exists():
-            return {"present": False, "disagreements": sorted(markdown)}
-        evidence: dict[str, object] = {"present": True}
+        evidence: dict[str, object] = {"present": False}
         disagreements: list[str] = []
         file_trust: dict[str, Provenance | None | Unreadable] = {
             key: note.provenance for key, note in notes.items()
         }
         try:
+            if not database.exists():
+                disagreements.extend(sorted(markdown))
+                if notes:
+                    raise FileNotFoundError("SQLite database is missing")
+                return {"present": False, "disagreements": []}
+            evidence["present"] = True
             # ro permits a live WAL read; never use immutable=1 (it ignores WAL).
             with sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True) as connection:
                 connection.row_factory = sqlite3.Row
@@ -190,7 +199,10 @@ class BasicMemoryInspector:
             for path, row in latest.items():
                 if row["operation"] == "delete" and path in markdown:
                     disagreements.append(f"delete tombstone still has Markdown file {path}")
-        except (sqlite3.Error, ValueError, TypeError) as exc:
-            evidence["unreadable"] = str(exc)
+        except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
+            reason = f"cannot inspect SQLite: {exc}"
+            evidence["unreadable"] = reason
+            for key, note in notes.items():
+                notes[key] = StoredNote(note.key, note.text, Unreadable(reason))
         evidence["disagreements"] = disagreements
         return evidence

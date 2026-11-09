@@ -221,3 +221,4 @@ and writes outside storage; native-library syscall coverage is not claimed.
 Restart closes stdin and allows at most 10 seconds of native drain. Forced
 termination is a failure, never a successful restart. There is no added sleep,
 storage repair, synthetic read envelope, or harness-owned promotion ceremony.
+Unreadable Markdown or accepted SQLite provenance is never outranked; SQLite inspection failures make every existing note's provenance unreadable while Markdown still determines text and existence.
