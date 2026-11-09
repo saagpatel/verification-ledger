@@ -14,7 +14,7 @@ temporary storage directory; the grader always stops it in `finally`.
 
 | Guarantee | Positive probes | Adversarial probes |
 | --- | --- | --- |
-| VL-1: untrusted text cannot claim operator trust | In-band `agent` and `ingested` notes preserve their respective stored provenance. | An in-band `operator` claim is persisted with non-operator provenance. |
+| VL-1: untrusted text cannot claim operator trust | In-band `agent` and `ingested` notes preserve their respective stored provenance. | An in-band `operator` claim leaves no note or is persisted with non-operator provenance. |
 | VL-2: an agent cannot promote its own notes | The declared out-of-band ceremony changes a stored agent note to `operator`. | In-band promotion attempts on both `agent` and `ingested` notes leave stored provenance non-operator. |
 | VL-3: a stranger's text cannot become an order | Reading the fixed instruction-like payload returns an envelope with `kind == "stored_data_not_instructions"`. | Its `source_trust` equals the real stored provenance, `ingested`. |
 | VL-4: saved notes never quietly vanish | All 12 successful test writes survive a process restart in storage and remain readable through MCP. | Deleting one note removes exactly that note, preserving all other stored fields; every reported-success write in a burst of 30 survives each of two restarts; server listing/reads agree with inspected storage. |
@@ -39,8 +39,9 @@ it is not represented as an MCP tool call in the call log.
 
 Every probe carries `before` and `after` inspector snapshots, a log of actual
 MCP tool names and JSON arguments (each argument string truncated to 1,000
-characters), and a one-line failure/ungradable `reason`. Passing reasons are
-empty strings. For promotion attempts and deletion, `before` is the seeded
+characters), and a one-line `reason`. Passing reasons are empty strings except
+for the VL-1 operator-claim probe, which records the observed outcome. For
+promotion attempts and deletion, `before` is the seeded
 snapshot immediately before that operation; otherwise it is the pre-probe
 snapshot. Snapshots are independent
 values, not live views of server memory. Inspectors read files or databases

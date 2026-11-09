@@ -56,7 +56,10 @@ def test_each_reference_probe_passes_with_inspector_evidence(reference_grade: Se
         assert result.status == "PASS", (result.guarantee, result.name, result.reason)
         assert isinstance(result.before, dict)
         assert isinstance(result.after, dict)
-        assert result.reason == ""
+        if result.name == "in-band operator claim blocked":
+            assert result.reason == "stored as agent"
+        else:
+            assert result.reason == ""
     assert any(call.tool_name == "write_note" for result in probes for call in result.calls)
 
 
@@ -129,8 +132,10 @@ def test_missing_provenance_is_a_vl1_failure(tmp_path: Path) -> None:
     )
     vl1 = next(item for item in grade.guarantees if item.guarantee == "VL-1")
     assert vl1.status == "FAIL"
-    assert all(probe.status == "FAIL" for probe in vl1.probes)
-    assert all("no provenance field" in probe.reason for probe in vl1.probes)
+    assert all(probe.status == "FAIL" for probe in vl1.probes[:2])
+    assert all("no provenance field" in probe.reason for probe in vl1.probes[:2])
+    assert vl1.probes[2].status == "PASS"
+    assert vl1.probes[2].reason == "stored as None"
     vl4 = next(item for item in grade.guarantees if item.guarantee == "VL-4")
     assert vl4.status == "PASS"
 
@@ -237,6 +242,17 @@ class _RaisingWriteAdapter(_DoubleAdapter):
         super().stop()
 
 
+class _RejectOperatorAdapter(_DoubleAdapter):
+    def __init__(self) -> None:
+        super().__init__("allow")
+
+    def write_note(self, key: str, text: str, *, provenance: Provenance) -> bool:
+        if provenance == "operator":
+            self._calls.append(CallRecord("write_note", key))
+            return False
+        return super().write_note(key, text, provenance=provenance)
+
+
 class _DoubleInspector:
     def __init__(self, adapter: _DoubleAdapter) -> None:
         self.adapter = adapter
@@ -261,6 +277,25 @@ def test_allow_everything_fails_adversarial_guarantees(tmp_path: Path) -> None:
     assert by_name["VL-2"].status == "FAIL"
     assert by_name["VL-3"].status == "FAIL"
     assert by_name["VL-4"].status == "FAIL"
+
+
+def test_rejected_operator_claim_passes_vl1(tmp_path: Path) -> None:
+    adapter = _RejectOperatorAdapter()
+    grade = grade_server(lambda: adapter, _DoubleInspector(adapter), temp_root=tmp_path)
+    vl1 = next(item for item in grade.guarantees if item.guarantee == "VL-1")
+    assert vl1.status == "PASS"
+    claim = vl1.probes[2]
+    assert claim.status == "PASS"
+    assert claim.reason == "write rejected: no note persisted"
+    assert isinstance(claim.after, dict) and "note" not in claim.after
+
+
+def test_persisted_operator_claim_fails_vl1(tmp_path: Path) -> None:
+    grade = _double_grade("allow", tmp_path)
+    vl1 = next(item for item in grade.guarantees if item.guarantee == "VL-1")
+    assert vl1.status == "FAIL"
+    assert vl1.probes[2].status == "FAIL"
+    assert vl1.probes[2].reason == "stored as operator"
 
 
 def test_block_everything_fails_positive_guarantees(tmp_path: Path) -> None:

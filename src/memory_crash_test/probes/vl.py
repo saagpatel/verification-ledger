@@ -24,7 +24,7 @@ class ProbeResult:
     before: StorageSnapshot | Unreadable
     after: StorageSnapshot | Unreadable
     calls: list[CallRecord]
-    reason: str  # empty on PASS; otherwise one line
+    reason: str  # one-line evidence or failure reason
 
 
 class _NotGradable(Exception):
@@ -51,6 +51,7 @@ class Probe:
     kind: ProbeKind
     name: str
     check: Callable[[_Context], str | None]
+    after_check: Callable[[StorageSnapshot], tuple[Status, str]] | None = None
 
     def run(self, adapter: MemoryServerAdapter, inspector: StorageInspector, storage_dir: Path) -> ProbeResult:
         """Run even with unreadable storage; preserve both snapshots on failures."""
@@ -75,6 +76,13 @@ class Probe:
             unreadable = before if isinstance(before, Unreadable) else after
             assert isinstance(unreadable, Unreadable)
             status, reason = "NOT_GRADABLE", unreadable.reason
+        elif status == "PASS" and self.after_check is not None:
+            try:
+                status, reason = self.after_check(after)
+            except _NotGradable as exc:
+                status, reason = "NOT_GRADABLE", str(exc)
+            except Exception as exc:
+                status, reason = "FAIL", f"probe raised {type(exc).__name__}: {exc}"
         return ProbeResult(
             self.guarantee, self.kind, self.name, status, context.before, after,
             adapter.calls(), " ".join(reason.splitlines()),
@@ -125,17 +133,26 @@ def _write_provenance(context: _Context, provenance: Provenance) -> str | None:
     return _stored_as(context, "note", provenance, "synthetic note")
 
 
-def _cannot_mint_operator(context: _Context, initial: Provenance | None) -> str | None:
-    if initial is None:
-        context.adapter.write_note("note", "synthetic note", provenance="operator")
-    else:
-        context.adapter.write_note("note", "synthetic note", provenance=initial)
-        before_attempt = context.inspector.snapshot(context.storage_dir)
-        context.before = before_attempt
-        context.adapter.update_provenance("note", "operator")
-        failure = _snapshot_stored_as(before_attempt, "note", initial, "synthetic note")
-        if failure is not None:
-            return failure
+def _initial_claim(context: _Context) -> None:
+    context.adapter.write_note("note", "synthetic note", provenance="operator")
+
+
+def _initial_claim_after(snapshot: StorageSnapshot) -> tuple[Status, str]:
+    note = snapshot.get("note")
+    if note is None:
+        return "PASS", "write rejected: no note persisted"
+    provenance = _provenance(note)
+    return ("FAIL" if provenance == "operator" else "PASS"), f"stored as {provenance}"
+
+
+def _cannot_mint_operator(context: _Context, initial: Provenance) -> str | None:
+    context.adapter.write_note("note", "synthetic note", provenance=initial)
+    before_attempt = context.inspector.snapshot(context.storage_dir)
+    context.before = before_attempt
+    context.adapter.update_provenance("note", "operator")
+    failure = _snapshot_stored_as(before_attempt, "note", initial, "synthetic note")
+    if failure is not None:
+        return failure
     note = context.snapshot().get("note")
     if note is None:
         return "note disappeared from storage instead of retaining non-operator provenance"
@@ -271,7 +288,7 @@ def all_probes() -> list[Probe]:
     return [
         Probe("VL-1", "positive", "agent provenance preserved", lambda c: _write_provenance(c, "agent")),
         Probe("VL-1", "positive", "ingested provenance preserved", lambda c: _write_provenance(c, "ingested")),
-        Probe("VL-1", "adversarial", "in-band operator claim blocked", lambda c: _cannot_mint_operator(c, None)),
+        Probe("VL-1", "adversarial", "in-band operator claim blocked", _initial_claim, _initial_claim_after),
         Probe("VL-2", "positive", "out-of-band ceremony promotes", _promote),
         Probe("VL-2", "adversarial", "agent cannot self-promote", lambda c: _cannot_mint_operator(c, "agent")),
         Probe("VL-2", "adversarial", "ingested cannot self-promote", lambda c: _cannot_mint_operator(c, "ingested")),
