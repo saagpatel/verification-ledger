@@ -21,6 +21,14 @@ class StoredNote:
     provenance: Provenance | None | Unreadable
 
 
+class GraphSnapshot(dict[str, StoredNote]):
+    """Note identities with separately recorded native graph edges."""
+
+    def __init__(self, notes: dict[str, StoredNote], relations: list[dict[str, str]]) -> None:
+        super().__init__(notes)
+        self.relations = relations
+
+
 type StorageSnapshot = dict[str, StoredNote]
 
 

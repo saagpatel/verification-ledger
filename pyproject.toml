@@ -35,6 +35,8 @@ packages = ["src/verification_ledger", "src/memory_crash_test"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-m 'not live'"
+markers = ["live: runs a local installed server"]
 
 [tool.pyright]
 pythonVersion = "3.12"

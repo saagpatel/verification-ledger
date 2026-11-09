@@ -12,7 +12,7 @@ from tempfile import TemporaryDirectory
 from memory_crash_test import SUITE_VERSION
 from memory_crash_test._json import mapping, sequence, string
 from memory_crash_test.adapters.base import CallRecord, MemoryServerAdapter, Provenance, ServerRelease
-from memory_crash_test.inspect.base import StorageInspector, StorageSnapshot, StoredNote, Unreadable
+from memory_crash_test.inspect.base import GraphSnapshot, StorageInspector, StorageSnapshot, StoredNote, Unreadable
 from memory_crash_test.probes.vl import (
     GUARANTEES, Guarantee, ProbeKind, ProbeResult, Status, all_probes, safe_snapshot,
 )
@@ -124,7 +124,10 @@ def _snapshot_json(snapshot: StorageSnapshot | Unreadable) -> dict[str, object]:
             "key": note.key, "text": note.text,
             "provenance": {"unreadable": provenance.reason} if isinstance(provenance, Unreadable) else provenance,
         }
-    return {"notes": notes}
+    result: dict[str, object] = {"notes": notes}
+    if isinstance(snapshot, GraphSnapshot):
+        result["relations"] = snapshot.relations
+    return result
 
 
 def _probe_json(probe: ProbeResult) -> dict[str, object]:
@@ -154,6 +157,10 @@ def _parse_snapshot(value: object) -> StorageSnapshot | Unreadable:
             stored_provenance if stored_provenance is None or isinstance(stored_provenance, Unreadable)
             else _provenance(stored_provenance),
         )
+    if "relations" in data:
+        relations = [{key: string(val) for key, val in mapping(item).items()}
+                     for item in sequence(data["relations"])]
+        return GraphSnapshot(notes, relations)
     return notes
 
 
