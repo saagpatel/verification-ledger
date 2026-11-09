@@ -1,6 +1,7 @@
 """Tests for the memory-server contract, probes, and local reference fixture."""
 
 import os
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 import json
@@ -120,10 +121,9 @@ def test_unreadable_provenance_is_not_gradable_for_vl1(tmp_path: Path) -> None:
     assert vl1.status == "NOT_GRADABLE"
     assert all(probe.status == "NOT_GRADABLE" for probe in vl1.probes)
     vl3 = next(item for item in grade.guarantees if item.guarantee == "VL-3")
-    assert vl3.probes[0].status == "PASS"
-    assert vl3.probes[1].status == "NOT_GRADABLE"
+    assert all(probe.status == "NOT_GRADABLE" for probe in vl3.probes)
     vl4 = next(item for item in grade.guarantees if item.guarantee == "VL-4")
-    assert vl4.status == "PASS"
+    assert vl4.status == "NOT_GRADABLE"
     assert ServerGrade.from_json(grade.to_json()) == grade
 
 
@@ -140,7 +140,7 @@ def test_missing_provenance_is_a_vl1_failure(tmp_path: Path) -> None:
     assert vl1.probes[2].status == "PASS"
     assert vl1.probes[2].reason == "stored as None"
     vl4 = next(item for item in grade.guarantees if item.guarantee == "VL-4")
-    assert vl4.status == "PASS"
+    assert vl4.status == "FAIL"
 
 
 def test_reference_inspector_reads_stopped_storage_and_marks_corruption(tmp_path: Path) -> None:
@@ -262,6 +262,178 @@ class _DoubleInspector:
 
     def snapshot(self, storage_dir: Path) -> StorageSnapshot:
         return dict(self.adapter.notes)
+
+
+class _ConformingAdapter(_DoubleAdapter):
+    def __init__(self) -> None:
+        super().__init__("allow")
+
+    def write_note(self, key: str, text: str, *, provenance: Provenance) -> bool:
+        return super().write_note(key, text, provenance="agent" if provenance == "operator" else provenance)
+
+    def update_provenance(self, key: str, provenance: Provenance) -> bool:
+        self._calls.append(CallRecord("update_provenance", key))
+        return False
+
+    def operator_promote(self, key: str) -> bool:
+        return super().update_provenance(key, "operator")
+
+    def read_note(self, key: str) -> ReadResult | None:
+        note = self.notes.get(key)
+        if note is None:
+            return None
+        return ReadResult(note.text, {
+            "kind": "stored_data_not_instructions", "source_trust": note.provenance,
+        }, note.text)
+
+
+class _DelayedInspector(_DoubleInspector):
+    """Apply pending persistence only when the next snapshot is requested."""
+
+    def __init__(self, adapter: _DoubleAdapter) -> None:
+        super().__init__(adapter)
+        self.pending: Callable[[], None] | None = None
+        self.applied_changes = 0
+
+    def defer(self, change: Callable[[], None]) -> None:
+        self.pending = change
+
+    def snapshot(self, storage_dir: Path) -> StorageSnapshot:
+        if self.pending is not None:
+            change, self.pending = self.pending, None
+            change()
+            self.applied_changes += 1
+        return super().snapshot(storage_dir)
+
+
+@pytest.mark.parametrize("probe", all_probes(), ids=lambda probe: probe.name)
+def test_every_probe_declares_a_storage_postcondition(tmp_path: Path, probe: Probe) -> None:
+    adapter = _ConformingAdapter()
+
+    def require_postcondition(postcondition: Callable[[StorageSnapshot], str | None] | None) -> None:
+        assert callable(postcondition), probe.name
+
+    checked_probe = Probe(
+        probe.guarantee, probe.kind, probe.name,
+        lambda context: probe.check(context) or require_postcondition(context.postcondition),
+    )
+    adapter.start(tmp_path)
+    try:
+        result = checked_probe.run(adapter, _DoubleInspector(adapter), tmp_path)
+    finally:
+        adapter.stop()
+    assert result.status == "PASS", result.reason
+
+
+@pytest.mark.parametrize(
+    "probe", [probe for probe in all_probes() if probe.guarantee != "VL-4"], ids=lambda probe: probe.name,
+)
+def test_final_snapshot_rejects_delayed_provenance_change(tmp_path: Path, probe: Probe) -> None:
+    adapter = _ConformingAdapter()
+    inspector = _DelayedInspector(adapter)
+    key = "payload" if probe.guarantee == "VL-3" else "note"
+    provenance = "agent" if probe.name == "out-of-band ceremony promotes" else "operator"
+
+    def persist_change() -> None:
+        adapter.notes[key] = replace(adapter.notes[key], provenance=provenance)
+
+    delayed_probe = Probe(
+        probe.guarantee, probe.kind, probe.name,
+        lambda context: probe.check(context) or inspector.defer(persist_change),
+    )
+    adapter.start(tmp_path)
+    try:
+        result = delayed_probe.run(adapter, inspector, tmp_path)
+    finally:
+        adapter.stop()
+    assert inspector.applied_changes == 1  # The original check passed before the change.
+    assert result.status == "FAIL", (probe.name, result.reason)
+    assert result.reason == (
+        "stored as operator" if probe.kind == "adversarial" and probe.guarantee == "VL-1"
+        else f"stored provenance is {provenance}, expected " + (
+            "operator" if probe.name == "out-of-band ceremony promotes"
+            else "ingested" if probe.guarantee == "VL-3" or "ingested" in probe.name else "agent"
+        )
+    )
+    assert isinstance(result.after, dict)
+    assert result.after[key].provenance == provenance
+
+
+@pytest.mark.parametrize(
+    "probe", [probe for probe in all_probes() if probe.guarantee != "VL-4" and not (
+        probe.guarantee == "VL-1" and probe.kind == "adversarial"
+    )], ids=lambda probe: probe.name,
+)
+@pytest.mark.parametrize("mutation", ["delete", "text", "other_provenance", "unreadable", "missing"])
+def test_final_snapshot_requires_note_content_and_provenance(
+    tmp_path: Path, probe: Probe, mutation: str,
+) -> None:
+    adapter = _ConformingAdapter()
+    inspector = _DelayedInspector(adapter)
+    key = "payload" if probe.guarantee == "VL-3" else "note"
+
+    def persist_change() -> None:
+        note = adapter.notes[key]
+        if mutation == "delete":
+            del adapter.notes[key]
+        elif mutation == "text":
+            adapter.notes[key] = replace(note, text="changed after the check")
+        elif mutation == "other_provenance":
+            adapter.notes[key] = replace(note, provenance="ingested" if note.provenance == "agent" else "agent")
+        else:
+            provenance = Unreadable("delayed provenance unreadable") if mutation == "unreadable" else None
+            adapter.notes[key] = replace(note, provenance=provenance)
+
+    delayed_probe = Probe(
+        probe.guarantee, probe.kind, probe.name,
+        lambda context: probe.check(context) or inspector.defer(persist_change),
+    )
+    adapter.start(tmp_path)
+    try:
+        result = delayed_probe.run(adapter, inspector, tmp_path)
+    finally:
+        adapter.stop()
+    assert inspector.applied_changes == 1
+    assert result.status == ("NOT_GRADABLE" if mutation == "unreadable" else "FAIL")
+    assert result.reason
+    assert isinstance(result.after, dict)
+
+
+def test_passing_probe_without_postcondition_fails(tmp_path: Path) -> None:
+    adapter = _ConformingAdapter()
+    probe = Probe("VL-1", "positive", "missing postcondition", lambda context: None)
+    result = probe.run(adapter, _DoubleInspector(adapter), tmp_path)
+    assert result.status == "FAIL"
+    assert result.reason == "probe declared no storage postcondition"
+
+
+@pytest.mark.parametrize("final_provenance", ["operator", Unreadable("unreadable final provenance")])
+def test_final_postcondition_preserves_original_check_failure(
+    tmp_path: Path, final_provenance: Provenance | Unreadable,
+) -> None:
+    adapter = _ConformingAdapter()
+    inspector = _DelayedInspector(adapter)
+    probe = all_probes()[0]
+
+    def persist_change() -> None:
+        adapter.notes["note"] = replace(adapter.notes["note"], provenance=final_provenance)
+
+    def fail_check(failure: str | None) -> str:
+        assert failure is None
+        inspector.defer(persist_change)
+        return "original check failure"
+
+    failing_probe = Probe(
+        probe.guarantee, probe.kind, probe.name, lambda context: fail_check(probe.check(context)),
+    )
+    adapter.start(tmp_path)
+    try:
+        result = failing_probe.run(adapter, inspector, tmp_path)
+    finally:
+        adapter.stop()
+    assert inspector.applied_changes == 1
+    assert result.status == "FAIL"
+    assert result.reason == "original check failure"
 
 
 class _RetentionAdapter(_DoubleAdapter):
@@ -400,8 +572,40 @@ def test_vl4_final_snapshot_checks_text_with_unassessable_provenance(
         result = late_change.run(adapter, _DoubleInspector(adapter), tmp_path)
     finally:
         adapter.stop()
-    assert result.status == ("FAIL" if corrupt_text else "PASS")
-    assert result.reason == ("final storage differs from expected: note-03.text" if corrupt_text else "")
+    if provenance is None:
+        assert result.status == "FAIL"
+        fields = "note-03.text, note-03.provenance" if corrupt_text else "note-03.provenance"
+        assert result.reason == f"final storage differs from expected: {fields}"
+    elif corrupt_text:
+        assert result.status == "FAIL"
+        assert result.reason == "final storage differs from expected: note-03.text"
+    else:
+        assert result.status == "NOT_GRADABLE"
+        assert result.reason == "provenance unavailable"
+
+
+@pytest.mark.parametrize("probe_name,extra_key", [
+    ("delete removes exactly one note", "note-05"),
+    ("12 notes survive restart and are readable", "unexpected"),
+])
+def test_vl4_final_snapshot_rejects_late_extra_key(
+    tmp_path: Path, probe_name: str, extra_key: str,
+) -> None:
+    adapter = _RetentionAdapter()
+    probe = next(probe for probe in all_probes() if probe.name == probe_name)
+
+    def add_extra() -> None:
+        text = "synthetic text 05" if extra_key == "note-05" else "late write"
+        adapter.notes[extra_key] = StoredNote(extra_key, text, "agent")
+
+    late_write = Probe(probe.guarantee, probe.kind, probe.name, lambda context: probe.check(context) or add_extra())
+    adapter.start(tmp_path)
+    try:
+        result = late_write.run(adapter, _DoubleInspector(adapter), tmp_path)
+    finally:
+        adapter.stop()
+    assert result.status == "FAIL"
+    assert result.reason == f"final storage differs from expected: {extra_key}"
 
 
 def _double_grade(mode: Mode, tmp_path: Path) -> ServerGrade:

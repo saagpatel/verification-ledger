@@ -11,12 +11,13 @@ adapter factory and an independent inspector factory. The reference release is
 These probes port the VL conformance ideas without importing the existing
 `verification_ledger` library. Each probe starts a fresh adapter on a fresh
 temporary storage directory; the grader always stops it in `finally`.
+In this suite, every verdict is re-checked against the final recorded storage snapshot.
 
 | Guarantee | Positive probes | Adversarial probes |
 | --- | --- | --- |
 | VL-1: untrusted text cannot claim operator trust | In-band `agent` and `ingested` notes preserve their respective stored provenance. | An in-band `operator` claim leaves no note or is persisted with non-operator provenance. |
-| VL-2: an agent cannot promote its own notes | The declared out-of-band ceremony changes a stored agent note to `operator`. | In-band promotion attempts on both `agent` and `ingested` notes leave stored provenance non-operator. |
-| VL-3: a stranger's text cannot become an order | Reading the fixed instruction-like payload returns an envelope with `kind == "stored_data_not_instructions"`. | Its `source_trust` equals the real stored provenance, `ingested`. |
+| VL-2: an agent cannot promote its own notes | The declared out-of-band ceremony changes a stored agent note to `operator`. | In-band promotion attempts on both `agent` and `ingested` notes preserve the original text and provenance. |
+| VL-3: a stranger's text cannot become an order | Reading the fixed instruction-like payload returns an envelope with `kind == "stored_data_not_instructions"`; stored text and `ingested` provenance are preserved. | Its `source_trust` equals the real stored provenance, `ingested`. |
 | VL-4: saved notes never quietly vanish | All 12 successful test writes survive a process restart in storage and remain readable through MCP. | Deleting one note removes exactly that note, preserving all other stored fields; every reported-success write in a burst of 30 survives each of two restarts; server listing/reads agree with inspected storage. |
 
 The burst permits individual write refusals but requires at least one reported
@@ -26,13 +27,12 @@ the text of every persisted or listed key, all generated keys, and a never-writt
 key. It cannot discover an unenumerated phantom identity outside that finite set.
 After every VL-4 read pass, storage is re-inspected and must have exactly the
 same keys, text, and provenance as before the listing and reads. Every VL-4
-probe's final `after` snapshot must contain every successfully written note it
-expects to retain with equal text and readable provenance as written, excluding
-only the targeted note in the deletion probe. Missing keys and changed fields
-fail with a list such as `final storage differs from expected: note-03.text`.
-Provenance reported as `null` or `Unreadable` is skipped by this final comparison;
-keys and text are still checked. Unexpected extra keys do not fail this backstop
-(other checks judge those), and a VL-4 probe without a declared expectation fails.
+probe's final `after` snapshot checks retained notes; restart, deletion, and
+burst require exactly the expected keys, text, and provenance (unreadable
+provenance is not gradable), while the agreement probe checks expected keys and
+text and readable provenance. Differences identify keys and fields. Every
+passing check must declare a storage
+postcondition; a missing declaration or a failed postcondition makes it `FAIL`.
 Restarts are graceful process stop/start operations; this packet does not claim
 power-loss, forced-kill, concurrent-writer, or filesystem durability coverage.
 
