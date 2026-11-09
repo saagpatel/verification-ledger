@@ -33,9 +33,11 @@ class ServerGrade:
     guarantees: list[GuaranteeGrade]
     run_at_utc: str
     suite_version: str
+    # Omitted from JSON when None so reports written before this field still parse.
+    maintainer_response: str | None = None
 
     def to_json(self) -> str:
-        return json.dumps({
+        payload: dict[str, object] = {
             "release": {"name": self.release.name, "version": self.release.version, "source": self.release.source},
             "guarantees": [{
                 "guarantee": grade.guarantee, "status": grade.status,
@@ -43,7 +45,10 @@ class ServerGrade:
             } for grade in self.guarantees],
             "run_at_utc": self.run_at_utc,
             "suite_version": self.suite_version,
-        }, indent=2, sort_keys=True) + "\n"
+        }
+        if self.maintainer_response is not None:
+            payload["maintainer_response"] = self.maintainer_response
+        return json.dumps(payload, indent=2, sort_keys=True) + "\n"
 
     @classmethod
     def from_json(cls, text: str) -> ServerGrade:
@@ -57,9 +62,10 @@ class ServerGrade:
                 _guarantee(item["guarantee"]), _status(item["status"]),
                 [_parse_probe(probe) for probe in sequence(item["probes"])],
             ))
+        response = string(root["maintainer_response"]) if "maintainer_response" in root else None
         return cls(
             ServerRelease(string(release["name"]), string(release["version"]), string(release["source"])),
-            guarantees, string(root["run_at_utc"]), string(root["suite_version"]),
+            guarantees, string(root["run_at_utc"]), string(root["suite_version"]), response,
         )
 
 
