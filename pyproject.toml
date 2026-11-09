@@ -13,7 +13,7 @@ dependencies = []
 # The MCP server wrapper (drop-in for an MCP-speaking fleet) is opt-in; the
 # core library and the conformance suite have no MCP dependency.
 mcp = ["mcp>=1.28.1,<2.0"]
-crash = ["mcp>=1.28.1,<2.0"]
+crash = ["mcp>=1.28.1,<2.0", "pyyaml>=6,<7"]
 
 [project.scripts]
 verification-ledger = "verification_ledger.__main__:main"
@@ -24,6 +24,7 @@ dev = [
     "pyright>=1.1.411",
     "pytest>=9.1.1",
     "ruff>=0.15.20",
+    "pyyaml>=6,<7",
 ]
 
 [build-system]
@@ -36,7 +37,7 @@ packages = ["src/verification_ledger", "src/memory_crash_test"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-m 'not live'"
-markers = ["live: runs a local installed server"]
+markers = ["live: runs a pinned server locally over stdio"]
 
 [tool.pyright]
 pythonVersion = "3.12"
