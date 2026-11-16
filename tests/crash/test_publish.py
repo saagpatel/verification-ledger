@@ -376,3 +376,22 @@ def test_publish_preflights_all_destinations_before_writing(tmp_path: Path, dest
     assert main(["publish", "--grades", str(source / "first.json"), str(source / "grade.json"), "--out", str(out)]) == 1
     assert target.read_bytes() == b"preserve this file exactly\n"
     assert set(out.rglob("*")) == original_paths
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_publish_refuses_ancestor_conflicts_before_writing(tmp_path: Path, existing: bool) -> None:
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    first.write_text(_grade(ServerRelease("first", "1.0.0", "lab")).to_json(), encoding="utf-8")
+    second.write_text(_grade(ServerRelease("index.html", "1.0.0", "lab")).to_json(), encoding="utf-8")
+    out = tmp_path / "out"
+    if existing:
+        out.mkdir()
+        (out / "keep.txt").write_bytes(b"keep\n")
+    original_paths: set[Path] = set(out.rglob("*")) if existing else set()
+    assert main(["publish", "--grades", str(first), str(second), "--out", str(out)]) == 1
+    if existing:
+        assert set(out.rglob("*")) == original_paths
+        assert (out / "keep.txt").read_bytes() == b"keep\n"
+    else:
+        assert not out.exists() or not any(out.rglob("*"))
