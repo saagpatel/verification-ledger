@@ -216,6 +216,12 @@ def write_cards(grades: Sequence[ServerGrade], out: Path) -> None:
         if destination in destinations.values():
             raise ValueError(f"multiple grades or index write {href}: {destination}")
         destinations[href] = destination
+    for href, destination in destinations.items():
+        for other_href, other in destinations.items():
+            if other != destination and other.is_relative_to(destination):
+                raise ValueError(
+                    f"output path {other_href} would sit inside the file written for {href}"
+                )
     for href, grade in planned.items():
         destination = destinations[href]
         destination.parent.mkdir(parents=True, exist_ok=True)
