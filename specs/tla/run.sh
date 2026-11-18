@@ -51,7 +51,7 @@ else
 fi
 
 status=0
-printf '%-32s %-10s %-28s %14s %12s %6s\n' CONFIG EXPECTED RESULT GENERATED DISTINCT DEPTH
+printf '%-32s %-26s %-26s %12s %10s %6s\n' CONFIG EXPECTED RESULT GENERATED DISTINCT DEPTH
 for name in "${configs[@]}"; do
     log="out/$name.log"
     "$java_bin" -XX:+UseParallelGC -cp "$TLA2TOOLS" tlc2.TLC \
@@ -81,7 +81,7 @@ for name in "${configs[@]}"; do
         verdict="UNEXPECTED"
         status=1
     fi
-    printf '%-32s %-10s %-28s %14s %12s %6s  %s\n' \
+    printf '%-32s %-26s %-26s %12s %10s %6s  %s\n' \
         "$name" "${want%%|*}" "$result" "${generated:--}" "${distinct:--}" "${depth:--}" "$verdict"
 done
 exit "$status"
