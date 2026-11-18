@@ -23,3 +23,6 @@ build/
 # Rendered grade cards (local artifacts; never commit)
 out/
 cards/
+
+# Hypothesis example database
+.hypothesis/
