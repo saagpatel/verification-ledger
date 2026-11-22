@@ -11,14 +11,18 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
 from verification_ledger.envelope import Envelope, boundary
 from verification_ledger.gate import evaluate_activation, evaluate_promotion
 from verification_ledger.integrity import (
     GENESIS,
+    SCHEMA_VERSION,
     LiveRecord,
     Meta,
     Receipt,
@@ -158,9 +162,32 @@ class Ledger:
         self._conn = sqlite3.connect(str(path))
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
-        existed = self._has_table("records")
-        self._conn.executescript(_SCHEMA)
-        self._migrate(existed)
+        # Schema creation and migration run under the write lock, so two
+        # processes opening the same legacy store cannot both migrate it.
+        with self._txn("IMMEDIATE"):
+            existed = self._has_table("records")
+            for statement in _SCHEMA.split(";"):
+                if statement.strip():
+                    self._conn.execute(statement)
+            self._migrate(existed)
+
+    @contextmanager
+    def _txn(self, mode: Literal["DEFERRED", "IMMEDIATE"]) -> Generator[None, None, None]:
+        """One SQLite transaction around a multi-statement operation.
+
+        ``DEFERRED`` gives a consistent read snapshot (WAL mode); ``IMMEDIATE``
+        also takes the write lock up front so no other writer interleaves. If
+        the connection is already inside a transaction, the block joins it.
+        """
+        if self._conn.in_transaction:
+            yield
+            return
+        self._conn.execute(f"BEGIN {mode}")
+        try:
+            yield
+        except BaseException:
+            self._conn.rollback()
+            raise
         self._conn.commit()
 
     def _has_table(self, name: str) -> bool:
@@ -170,40 +197,46 @@ class Ledger:
         return row is not None
 
     def _migrate(self, existed: bool) -> None:
-        """Bring a store written by an earlier version up to the receipt chain.
+        """Start the receipt chain on a new store, or migrate a pre-chain store.
 
-        Idempotent: adds the receipt columns if missing, fills digests and links
-        only for receipts that have none (an existing link is never recomputed),
-        and writes the chain metadata only when this store is new or is being
-        upgraded. Metadata that has gone missing from an already-chained store is
-        not recreated; health reports it.
+        Runs exactly once per store, on a real schema transition:
+
+        - a new store gets empty chain metadata and the schema version;
+        - a store written before the chain existed (its ``durable_receipts``
+          table has no integrity columns) gets the columns, a digest and link
+          for every receipt, the chain metadata and the schema version.
+
+        A store already on the chain schema is never touched here. Missing or
+        NULL integrity fields, or missing metadata, are evidence of tampering
+        and stay for health to report; reopening must not repair them.
         """
+        if not existed:
+            self._set_meta(0, GENESIS)
+            self._set_version()
+            return
         cols = {
             str(r["name"])
             for r in self._conn.execute("PRAGMA table_info(durable_receipts)")
         }
+        if all(col in cols for col in _RECEIPT_COLUMNS):
+            return  # already on the chain schema
         for col in _RECEIPT_COLUMNS:
             if col not in cols:
                 self._conn.execute(
                     f"ALTER TABLE durable_receipts ADD COLUMN {col} TEXT"
                 )
         receipts = self._receipts()
-        legacy = [r for r in receipts if r.receipt_hash is None or r.digest is None]
-        if legacy:
-            for r in relink(receipts, self._live_records()):
-                if r in receipts:
-                    continue
-                self._conn.execute(
-                    "UPDATE durable_receipts SET digest = ?, prev_hash = ?, "
-                    "receipt_hash = ? WHERE record_id = ?",
-                    (r.digest, r.prev_hash, r.receipt_hash, r.record_id),
-                )
-            logger.info("migrated %d durable receipts to the hash chain", len(legacy))
-        meta = self._meta()
-        if not existed or legacy or (meta.count is None and not receipts):
-            chained = self._receipts()
-            head = chained[-1].receipt_hash if chained else GENESIS
-            self._set_meta(len(chained), head or GENESIS)
+        chained = relink(receipts, self._live_records())
+        for r in chained:
+            self._conn.execute(
+                "UPDATE durable_receipts SET digest = ?, prev_hash = ?, "
+                "receipt_hash = ? WHERE record_id = ?",
+                (r.digest, r.prev_hash, r.receipt_hash, r.record_id),
+            )
+        head = chained[-1].receipt_hash if chained else GENESIS
+        self._set_meta(len(chained), head or GENESIS)
+        self._set_version()
+        logger.info("migrated %d durable receipts to the hash chain", len(chained))
 
     def _receipts(self) -> list[Receipt]:
         rows = self._conn.execute(
@@ -235,6 +268,14 @@ class Ledger:
         return Meta(
             count=int(count) if count is not None and count.isdigit() else None,
             head=values.get("durable_head"),
+            version=values.get("schema_version"),
+        )
+
+    def _set_version(self) -> None:
+        self._conn.execute(
+            "INSERT INTO ledger_meta (key, value) VALUES ('schema_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (SCHEMA_VERSION,),
         )
 
     def _set_meta(self, count: int, head: str) -> None:
@@ -276,6 +317,16 @@ class Ledger:
                 "clamped in-band operator write to agent (payload len=%d)", len(payload)
             )
         created_at = _utc_now()
+        with self._txn("IMMEDIATE"):
+            rowid = self._insert(payload, source_trust, durable, created_at)
+        return WriteResult(
+            record_id=rowid, source_trust=source_trust, clamped=clamped
+        )
+
+    def _insert(
+        self, payload: str, source_trust: Trust, durable: bool, created_at: str
+    ) -> int:
+        """The row and, for a durable record, its receipt; inside one transaction."""
         cursor = self._conn.execute(
             "INSERT INTO records (payload, source_trust, durable, actionable, created_at) "
             "VALUES (?, ?, ?, 0, ?)",
@@ -287,10 +338,9 @@ class Ledger:
         if durable:
             # VL-4: the durable receipt is the tally the health check verifies
             # against. It carries a digest of the content and a link over the
-            # previous receipt; the metadata keeps the chain's length and head.
-            # All of it is in the same transaction as the row, and the INSERT
-            # above already holds the write lock, so the head read here is the
-            # latest one.
+            # recorded chain head; the metadata keeps the chain's length and
+            # head. The caller holds the write lock, so the head read here is
+            # the latest one.
             rid = int(rowid)
             digest = content_digest(rid, payload, created_at)
             meta = self._meta()
@@ -302,11 +352,11 @@ class Ledger:
                 "VALUES (?, ?, ?, ?, ?)",
                 (rid, created_at, digest, prev, link),
             )
-            self._set_meta((meta.count or 0) + 1, link)
-        self._conn.commit()
-        return WriteResult(
-            record_id=int(rowid), source_trust=source_trust, clamped=clamped
-        )
+            if meta.count is not None and meta.head is not None:
+                self._set_meta(meta.count + 1, link)
+            # Otherwise the metadata is missing: leave it missing, so health
+            # keeps reporting it. A write must never repair evidence.
+        return int(rowid)
 
     def read(self, record_id: int) -> EnvelopedRecord | None:
         """VL-3: return a record wrapped in the instruction-boundary envelope."""
@@ -333,8 +383,13 @@ class Ledger:
         Trust-gated: an operator record activates in one call; every non-operator
         record is refused and nothing is mutated. Refusal is reported, not raised,
         so a caller can distinguish a governed refusal from a missing record
-        (which raises ``KeyError``).
+        (which raises ``KeyError``). The read and the guarded write run in one
+        transaction holding the write lock.
         """
+        with self._txn("IMMEDIATE"):
+            return self._activate(record_id, channel)
+
+    def _activate(self, record_id: int, channel: Channel) -> ActivationResult:
         row = self._conn.execute(
             "SELECT source_trust, actionable FROM records WHERE id = ?", (record_id,)
         ).fetchone()
@@ -358,7 +413,6 @@ class Ledger:
             "UPDATE records SET actionable = 1 WHERE id = ? AND source_trust = 'operator'",
             (record_id,),
         )
-        self._conn.commit()
         # Report the guarded write's real outcome, not the pre-write decision: if
         # the guard no-oped (trust changed after the SELECT), actionable is
         # unchanged and we say so rather than over-reporting success.
@@ -391,8 +445,14 @@ class Ledger:
         keystone fails closed, so an integrator who forgets to thread the channel
         is refused rather than silently minting operator trust. The only
         legitimate caller — the out-of-band promotion CLI — passes
-        ``Channel.OUT_OF_BAND`` explicitly.
+        ``Channel.OUT_OF_BAND`` explicitly. The read and the update run in one
+        transaction holding the write lock, so the record cannot vanish between
+        them and the result reports what was written.
         """
+        with self._txn("IMMEDIATE"):
+            return self._promote(record_id, channel)
+
+    def _promote(self, record_id: int, channel: Channel) -> PromotionResult:
         row = self._conn.execute(
             "SELECT source_trust FROM records WHERE id = ?", (record_id,)
         ).fetchone()
@@ -412,7 +472,6 @@ class Ledger:
         self._conn.execute(
             "UPDATE records SET source_trust = 'operator' WHERE id = ?", (record_id,)
         )
-        self._conn.commit()
         logger.info(
             "promotion: record=%d %s -> operator (out-of-band)", record_id, current
         )
@@ -424,24 +483,28 @@ class Ledger:
         Durable records are exempt and uncounted against the cap. The delete has a
         SQL-level ``durable = 0`` backstop in addition to the pure selection, so a
         durable record cannot be removed even if the selection were wrong; a
-        mismatch trips the invariant monitor.
+        mismatch trips the invariant monitor. The selection and the delete run in
+        one transaction holding the write lock, so a concurrent writer or pruner
+        cannot change the rows in between and trip the monitor falsely.
         """
-        rows = self._conn.execute(
-            "SELECT id, durable FROM records ORDER BY id DESC"
-        ).fetchall()
-        candidates = [
-            RetentionCandidate(int(r["id"]), bool(r["durable"])) for r in rows
-        ]
-        to_delete = select_prunable(candidates, keep=keep)
-        if not to_delete:
-            return PruneResult(pruned_ids=(), pruned_count=0)
-        placeholders = ",".join("?" for _ in to_delete)
-        cursor = self._conn.execute(
-            f"DELETE FROM records WHERE id IN ({placeholders}) AND durable = 0",
-            to_delete,
-        )
-        self._conn.commit()
-        deleted = cursor.rowcount
+        if keep < 0:
+            raise ValueError("keep must be non-negative")
+        with self._txn("IMMEDIATE"):
+            rows = self._conn.execute(
+                "SELECT id, durable FROM records ORDER BY id DESC"
+            ).fetchall()
+            candidates = [
+                RetentionCandidate(int(r["id"]), bool(r["durable"])) for r in rows
+            ]
+            to_delete = select_prunable(candidates, keep=keep)
+            if not to_delete:
+                return PruneResult(pruned_ids=(), pruned_count=0)
+            placeholders = ",".join("?" for _ in to_delete)
+            cursor = self._conn.execute(
+                f"DELETE FROM records WHERE id IN ({placeholders}) AND durable = 0",
+                to_delete,
+            )
+            deleted = cursor.rowcount
         InvariantMonitor(self._policy).always(
             deleted == len(to_delete),
             f"VL-4: prune removed {deleted} of {len(to_delete)} targeted rows; "
@@ -459,11 +522,16 @@ class Ledger:
         and links or chain metadata that do not verify are each counted. Under
         ``RAISE`` this call raises on the first kind found; under ``REPORT`` it
         returns a report with ``ok=False`` and every counter.
+
+        Every input (counts, receipts, records, metadata) is read inside one
+        read transaction, so a write committed by another connection mid-check
+        cannot produce a false alarm.
         """
-        total = self._count("SELECT COUNT(*) FROM records")
-        durable = self._count("SELECT COUNT(*) FROM records WHERE durable = 1")
-        prunable = self._count("SELECT COUNT(*) FROM records WHERE durable = 0")
-        report = verify(self._receipts(), self._live_records(), self._meta())
+        with self._txn("DEFERRED"):
+            total = self._count("SELECT COUNT(*) FROM records")
+            durable = self._count("SELECT COUNT(*) FROM records WHERE durable = 1")
+            prunable = self._count("SELECT COUNT(*) FROM records WHERE durable = 0")
+            report = verify(self._receipts(), self._live_records(), self._meta())
         orphans = report.missing_records
         monitor = InvariantMonitor(self._policy)
         checks = [

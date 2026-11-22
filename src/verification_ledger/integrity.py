@@ -11,9 +11,14 @@ chain against the live records and counts four kinds of violation separately:
 - ``missing_records``: a receipt whose durable record is gone or no longer
   durable (a loss or a demotion);
 - ``missing_receipts``: a durable record with no receipt;
-- ``chain_breaks``: a receipt whose links do not verify, or a chain whose
-  length or head disagrees with the metadata (a receipt removed from the middle
-  or the end of the chain).
+- ``chain_breaks``: a receipt whose links do not verify or whose integrity
+  fields are missing, or a chain whose length, head or schema version disagrees
+  with the metadata (a receipt removed from the middle or the end of the chain,
+  or metadata deleted).
+
+Missing integrity fields in a store already on the chain schema are evidence,
+not legacy data: ``relink`` (the migration step) runs only when a store moves
+up from the pre-chain schema, never on a store that already has the columns.
 
 This module is pure (no I/O) so the checks are exhaustively testable; the ledger
 owns the tables and applies it.
@@ -33,6 +38,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 GENESIS = "0" * 64
+# The chain schema version recorded in the store metadata. It is written only
+# when a store is created or migrated up from the pre-chain schema; health
+# treats a missing or different value as a chain break.
+SCHEMA_VERSION = "2"
 # Digest recorded by the migration for a receipt whose record was already gone
 # when the store was upgraded: there is no content left to hash, and the loss
 # is still reported as a missing record.
@@ -76,10 +85,12 @@ class LiveRecord:
 
 @dataclass(frozen=True)
 class Meta:
-    """The chain's length and head as the store recorded them (None if absent)."""
+    """The chain's length, head and schema version as the store recorded them
+    (None where absent)."""
 
     count: int | None
     head: str | None
+    version: str | None = None
 
 
 @dataclass(frozen=True)
@@ -126,7 +137,11 @@ def verify(
         # rather than cascading down the rest of the chain.
         expected_prev = r.receipt_hash if r.receipt_hash is not None else expected_prev
     head = receipts[-1].receipt_hash if receipts else GENESIS
-    if meta.count != len(receipts) or meta.head != head:
+    if (
+        meta.count != len(receipts)
+        or meta.head != head
+        or meta.version != SCHEMA_VERSION
+    ):
         chain_breaks += 1  # truncated, extended, or metadata missing
     receipted = {r.record_id for r in receipts}
     missing_receipts = sum(
