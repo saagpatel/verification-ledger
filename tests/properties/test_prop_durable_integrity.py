@@ -300,11 +300,17 @@ def _legacy_store(db: str, writes: list[tuple[str, bool]], lost: set[int]) -> li
     return durable
 
 
-def _receipt_rows(led: Ledger) -> list[tuple[object, ...]]:
+def _receipts_only(led: Ledger) -> list[tuple[object, ...]]:
     return [
         tuple(r)
         for r in _conn(led).execute("SELECT * FROM durable_receipts ORDER BY record_id")
-    ] + [tuple(r) for r in _conn(led).execute("SELECT * FROM ledger_meta ORDER BY key")]
+    ]
+
+
+def _receipt_rows(led: Ledger) -> list[tuple[object, ...]]:
+    return _receipts_only(led) + [
+        tuple(r) for r in _conn(led).execute("SELECT * FROM ledger_meta ORDER BY key")
+    ]
 
 
 @given(
@@ -336,7 +342,7 @@ def test_migration_chains_a_legacy_store_idempotently(
                 )
             }
             assert sentinels == gone
-            first = _receipt_rows(led)
+            first = _receipts_only(led)
             # New writes extend the migrated chain.
             led.write("after upgrade", durable=True)
             assert led.health().violation_count == len(gone)
@@ -344,7 +350,7 @@ def test_migration_chains_a_legacy_store_idempotently(
         with Ledger(db, policy=FailurePolicy.REPORT) as led:
             assert _receipt_rows(led) == after_write  # reopening changes nothing
             # The migrated receipts are an unchanged prefix of the extended chain.
-            assert after_write[: len(first) - 2] == first[:-2]
+            assert after_write[: len(first)] == first
             survivors = [r for r in durable if r not in gone]
             if survivors:
                 _conn(led).execute(
@@ -378,3 +384,152 @@ def test_raise_policy_names_the_violation_kind(policy: FailurePolicy) -> None:
             "VL-4: 1 durable record(s) overwritten: content no longer matches its "
             "receipt digest",
         )
+
+
+# --- reopening must never repair evidence (round 2 review) ---
+#
+# The migration runs only on a real schema transition (a pre-chain
+# durable_receipts table without integrity columns). In a store already on the
+# chain schema, NULL integrity fields and missing metadata are evidence; neither
+# reopening nor a later write may recompute or recreate them.
+
+
+def _reopen_health(db: str) -> HealthReport:
+    with Ledger(db, policy=FailurePolicy.REPORT) as led:
+        return led.health()
+
+
+def _evidence(db: str) -> tuple[list[tuple[object, ...]], list[tuple[object, ...]]]:
+    raw = sqlite3.connect(db)
+    try:
+        receipts = [
+            tuple(r)
+            for r in raw.execute("SELECT * FROM durable_receipts ORDER BY record_id")
+        ]
+        meta = [tuple(r) for r in raw.execute("SELECT * FROM ledger_meta ORDER BY key")]
+    finally:
+        raw.close()
+    return receipts, meta
+
+
+@given(
+    writes=stores(),
+    pick=st.integers(0, 50),
+    nulled=st.sets(
+        st.sampled_from(["digest", "prev_hash", "receipt_hash"]), min_size=1
+    ),
+    forged=st.text(min_size=1, max_size=10),
+    overwrite=st.booleans(),
+)
+@example(
+    writes=[("shipped artifact", True)],
+    pick=0,
+    nulled={"digest"},
+    forged="forged",
+    overwrite=True,
+)
+def test_reopening_never_backfills_nulled_receipt_fields(
+    writes: list[tuple[str, bool]],
+    pick: int,
+    nulled: set[str],
+    forged: str,
+    overwrite: bool,
+) -> None:
+    # The review's counterexample: overwrite a durable payload and NULL its
+    # receipt digest. Before the fix, reopening treated the NULL as legacy data
+    # and recomputed digest, link and metadata, reporting healthy.
+    with tempfile.TemporaryDirectory() as tmp:
+        db = str(Path(tmp) / "fleet.db")
+        with Ledger(db, policy=FailurePolicy.REPORT) as led:
+            durable: list[int] = []
+            for payload, d in writes:
+                rid = led.write(payload, durable=d).record_id
+                if d:
+                    durable.append(rid)
+            rid = durable[pick % len(durable)]
+            conn = _conn(led)
+            if overwrite:
+                conn.execute(
+                    "UPDATE records SET payload = payload || ? WHERE id = ?",
+                    (forged, rid),
+                )
+            for col in sorted(nulled):
+                conn.execute(
+                    f"UPDATE durable_receipts SET {col} = NULL WHERE record_id = ?",
+                    (rid,),
+                )
+            conn.commit()
+            before = led.health()
+        assert before.ok is False and before.chain_breaks >= 1
+        if overwrite:
+            assert before.digest_mismatches == 1
+        evidence = _evidence(db)
+        for _ in range(2):
+            after = _reopen_health(db)
+            assert after == before  # identical report, every counter
+            assert _evidence(db) == evidence  # reopening rewrote nothing
+
+
+@given(
+    writes=stores(),
+    drop=st.sampled_from(["rows", "version", "count", "head", "table"]),
+    erase_all=st.booleans(),
+    then_write=st.booleans(),
+)
+def test_missing_metadata_is_never_recreated(
+    writes: list[tuple[str, bool]], drop: str, erase_all: bool, then_write: bool
+) -> None:
+    # Deleting the metadata (all of it, one key, or the whole table), even
+    # together with every durable row and receipt, stays reported across
+    # reopening and across later durable writes.
+    with tempfile.TemporaryDirectory() as tmp:
+        db = str(Path(tmp) / "fleet.db")
+        with Ledger(db, policy=FailurePolicy.REPORT) as led:
+            for payload, d in writes:
+                led.write(payload, durable=d)
+            conn = _conn(led)
+            if erase_all:
+                conn.execute("DELETE FROM records WHERE durable = 1")
+                conn.execute("DELETE FROM durable_receipts")
+            if drop == "table":
+                conn.execute("DROP TABLE ledger_meta")
+            elif drop == "rows":
+                conn.execute("DELETE FROM ledger_meta")
+            else:
+                key = {
+                    "version": "schema_version",
+                    "count": "durable_count",
+                    "head": "durable_head",
+                }[drop]
+                conn.execute("DELETE FROM ledger_meta WHERE key = ?", (key,))
+            conn.commit()
+        assert _reopen_health(db).chain_breaks >= 1
+        if then_write:
+            with Ledger(db, policy=FailurePolicy.REPORT) as led:
+                led.write("later", durable=True)
+                led.write("later, plain")
+        h = _reopen_health(db)
+        assert h.ok is False and h.chain_breaks >= 1
+
+
+def test_migration_runs_only_on_the_pre_chain_schema() -> None:
+    # A store already on the chain schema is never migrated again, whatever its
+    # receipts look like; a pre-chain store is migrated exactly once.
+    with tempfile.TemporaryDirectory() as tmp:
+        db = str(Path(tmp) / "legacy.db")
+        _legacy_store(db, [("a", True), ("b", True)], set())
+        with Ledger(db, policy=FailurePolicy.REPORT) as led:
+            assert led.health().ok
+            version = (
+                _conn(led)
+                .execute("SELECT value FROM ledger_meta WHERE key = 'schema_version'")
+                .fetchone()
+            )
+            assert version is not None and version[0] == "2"
+            _conn(led).execute(
+                "UPDATE durable_receipts SET digest = NULL, prev_hash = NULL, receipt_hash = NULL"
+            )
+            _conn(led).commit()
+        evidence = _evidence(db)
+        assert _reopen_health(db).chain_breaks >= 1
+        assert _evidence(db) == evidence
