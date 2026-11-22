@@ -98,7 +98,7 @@ class ReferenceAdapter:
         return self._led.health().ok
 
     def durable_violations(self) -> int:
-        return self._led.health().durable_orphans
+        return self._led.health().violation_count
 
     def force_durable_loss(self, record_id: int) -> None:
         # Store-level deletion behind the API: the ledger exposes no delete, so
