@@ -533,3 +533,20 @@ def test_migration_runs_only_on_the_pre_chain_schema() -> None:
         evidence = _evidence(db)
         assert _reopen_health(db).chain_breaks >= 1
         assert _evidence(db) == evidence
+
+
+def test_rebuilding_the_pre_chain_schema_is_the_documented_limit() -> None:
+    # Out of scope, like the consistent whole-chain rewrite: a writer who drops
+    # the integrity columns and the metadata so the store looks pre-chain gets
+    # a fresh migration on the next open. Pinned so a change is noticed.
+    with tempfile.TemporaryDirectory() as tmp:
+        db = str(Path(tmp) / "fleet.db")
+        with Ledger(db, policy=FailurePolicy.REPORT) as led:
+            rid = led.write("shipped", durable=True).record_id
+            conn = _conn(led)
+            conn.execute("UPDATE records SET payload = 'forged' WHERE id = ?", (rid,))
+            for col in ("digest", "prev_hash", "receipt_hash"):
+                conn.execute(f"ALTER TABLE durable_receipts DROP COLUMN {col}")
+            conn.execute("DROP TABLE ledger_meta")
+            conn.commit()
+        assert _reopen_health(db).ok is True
