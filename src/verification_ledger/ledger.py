@@ -469,7 +469,7 @@ class Ledger:
         checks = [
             monitor.always(
                 orphans == 0,
-                f"VL-4: {orphans} durable record(s) lost or demoted — retention must "
+                f"VL-4: {orphans} durable record(s) lost or demoted: retention must "
                 "never drop a durable record",
             ),
             monitor.always(
