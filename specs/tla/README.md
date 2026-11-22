@@ -28,8 +28,10 @@ any configuration's result differs from its expectation.
 
 ## Bounds
 
-Every configuration uses the same bounds: **3 record slots, 3 in-band agents
-(symmetric), keep in {0, 1}**, plus the operator and the store-level adversary.
+Every configuration uses the same bounds, **3 record slots, 3 in-band agents
+(symmetric), keep in {0, 1}**, plus the operator and the store-level adversary,
+except `Check_MetaErased`, which uses 2 agents: adding metadata deletion on top
+of receipt erasure multiplies the state space about fourfold.
 Each agent may hold one pending second statement (activation's guarded UPDATE
 or prune's DELETE) while every other actor moves, so the interleavings between
 the two statements of `activate()` and `prune()` are all explored.
@@ -49,6 +51,8 @@ the two statements of `activate()` and `prune()` are all explored.
 | `Control_HealthIgnoresDigest` | health skips the digest comparison; adversary may overwrite | `VL4_LossDetected` violated (an overwrite goes unseen) |
 | `Control_HealthIgnoresChainMeta` | health skips the length and head check; adversary may erase receipts | `VL4_LossDetected` violated (erasing the newest receipt leaves every link valid) |
 | `Control_ConsistentChainRewrite` | adversary overwrites or erases, then recomputes every digest, link and the metadata | `VL4_LossDetected` violated: the documented out-of-scope case, undetectable without an anchor outside the store |
+| `Check_MetaErased` | adversary may also delete the chain metadata; writes never recreate it (2 agents) | no violation |
+| `Control_WriteRecreatesMeta` | as `Check_MetaErased`, but a durable write recreates missing metadata (the round 2 review bug) | `VL4_LossDetected` violated: erase the only durable record and its receipt, delete the metadata, write a new durable record, and the chain verifies |
 | `Witness_FastPath` | all real mechanisms; checks `NoRecordEverActionable` | violated, which exhibits an operator record becoming actionable |
 
 ## Invariants and properties
@@ -79,13 +83,12 @@ the two statements of `activate()` and `prune()` are all explored.
    except in a log line, so a non-operator record is refused on either channel.
    SPEC.md only says it is refused in-band. The model's activation has no
    channel.
-3. **Two statements, not one transition.** `activate()` is a SELECT plus a
-   guarded UPDATE and `prune()` a SELECT plus a guarded DELETE; another process
-   on the same file store (the promotion CLI, a second server) can interleave.
-   Modeled as two steps per agent. `promote()` is a SELECT plus an unguarded
-   UPDATE; because trust only ever rises it is modeled as one step. One
-   reporting-only consequence: if the row is pruned between the two statements,
-   `promote()` still returns `promoted=True` for a row that no longer exists.
+3. **Two statements, one transaction.** `activate()` is a SELECT plus a
+   guarded UPDATE and `prune()` a SELECT plus a guarded DELETE. Since the round
+   2 review both run inside one transaction holding the write lock, so no other
+   process can interleave; the model still lets other actors move between the
+   two steps, which over-approximates the code and keeps every safety result
+   sound. `promote()` (SELECT plus UPDATE, also under the lock) is one step.
 4. **Two ways to mint operator out-of-band.** SPEC.md VL-2 says promotion to
    operator happens only through the ceremony; the code also accepts a direct
    out-of-band operator write (the reference adapter's `seed_operator`). Both
@@ -103,10 +106,19 @@ the two statements of `activate()` and `prune()` are all explored.
    overwrite or a removed receipt (even the newest) is reported. A writer who
    recomputes the whole chain and metadata consistently is not;
    `Control_ConsistentChainRewrite` shows that trace. SPEC.md states this scope.
-9. **The durable write is one step.** `write()` inserts the row first (taking
-   SQLite's write lock), then reads the chain head and appends the receipt in
-   the same transaction, so no other writer can slip in between; it is modeled
-   as one atomic step.
+9. **The durable write is one step.** `write()` runs in one transaction that
+   holds the write lock: it inserts the row, reads the chain head and appends
+   the receipt, so no other writer can slip in between; it is modeled as one
+   atomic step. If the chain metadata is missing it links from genesis and
+   leaves the metadata missing.
+10. **Health reads one snapshot.** `health()` reads its counts, receipts,
+    records and metadata inside one read transaction; the model evaluates
+    health as a predicate over one state, which is exactly that. Before the
+    round 2 fix the reads were separate and a concurrent durable write could
+    raise a false alarm (now a deterministic regression test).
+11. **Migration is not modeled.** Opening a pre-chain store migrates it once,
+    on the schema transition only; that path, and the rule that reopening
+    never repairs evidence, are covered by the property tests, not by TLC.
 
 ## Results
 
