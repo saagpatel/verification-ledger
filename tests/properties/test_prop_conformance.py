@@ -38,7 +38,9 @@ TRUSTS = (c.OPERATOR, c.AGENT, c.INGESTED)
 CHANNELS = (c.IN_BAND, c.OUT_OF_BAND)
 
 Clamp = Literal["agent", "ingested", "none", "agent_plus_shadow"]
-Activate = Literal["gate", "allow", "block", "insert_operator", "gate_spill"]
+Activate = Literal[
+    "gate", "allow", "block", "insert_operator", "gate_spill", "activate_and_demote"
+]
 PromoteInBand = Literal["refuse", "mint", "make_actionable", "insert_operator"]
 PromoteOob = Literal["exact", "all_records", "refuse", "insert_operator"]
 EnvelopeMode = Literal["honest", "agent_as_operator", "operator_label", "missing"]
@@ -68,6 +70,7 @@ class _Row:
     trust: str
     actionable: bool
     durable: bool
+    payload: str = ""
 
 
 @dataclass
@@ -99,17 +102,17 @@ class PolicyStore:
                 "agent_plus_shadow": c.AGENT,
             }[self.policy.clamp]
             relabeled = trust != c.OPERATOR
-        rid = self._insert(trust, durable)
+        rid = self._insert(trust, durable, payload)
         if relabeled:
             self.clamped.add(rid)
             if self.policy.clamp == "agent_plus_shadow":
-                self._insert(c.OPERATOR, False)  # an operator copy on the side
+                self._insert(c.OPERATOR, False, payload)  # an operator copy on the side
         return rid
 
-    def _insert(self, trust: str, durable: bool) -> int:
+    def _insert(self, trust: str, durable: bool, payload: str = "side") -> int:
         rid = self.next_id
         self.next_id += 1
-        self.rows[rid] = _Row(trust, self.policy.born_actionable, durable)
+        self.rows[rid] = _Row(trust, self.policy.born_actionable, durable, payload)
         if durable:
             self.receipts.add(rid)
         return rid
@@ -131,7 +134,14 @@ class PolicyStore:
             ):
                 label = c.OPERATOR
             env = {"kind": BOUNDARY_KIND, "source_trust": label, "warning": "w"}
-        return StoredRecord(record_id, row.trust, row.actionable, env)
+        return StoredRecord(
+            record_id,
+            row.trust,
+            row.actionable,
+            env,
+            payload=row.payload,
+            durable=row.durable,
+        )
 
     def activate(self, record_id: int, *, channel: str) -> bool:
         row = self.rows[record_id]
@@ -145,6 +155,8 @@ class PolicyStore:
             if self.policy.activate == "gate_spill":
                 for other in self.rows.values():
                     other.actionable = True
+            elif self.policy.activate == "activate_and_demote":
+                row.trust = c.AGENT  # leaves an actionable non-operator record
         elif self.policy.activate == "insert_operator":
             self._insert(c.OPERATOR, False)  # refuses, but mints a record
         return row.actionable
@@ -202,8 +214,11 @@ class PolicyStore:
 
     # --- oracle-only access: not part of the adapter contract ---
 
-    def snapshot(self) -> dict[int, tuple[str, bool, bool]]:
-        return {i: (r.trust, r.actionable, r.durable) for i, r in self.rows.items()}
+    def snapshot(self) -> dict[int, tuple[str, bool, bool, str]]:
+        return {
+            i: (r.trust, r.actionable, r.durable, r.payload)
+            for i, r in self.rows.items()
+        }
 
     def force_lose(self, record_id: int) -> None:
         del self.rows[record_id]
@@ -213,7 +228,14 @@ policies = st.builds(
     Policy,
     clamp=st.sampled_from(["agent", "ingested", "none", "agent_plus_shadow"]),
     activate=st.sampled_from(
-        ["gate", "allow", "block", "insert_operator", "gate_spill"]
+        [
+            "gate",
+            "allow",
+            "block",
+            "insert_operator",
+            "gate_spill",
+            "activate_and_demote",
+        ]
     ),
     promote_in_band=st.sampled_from(
         ["refuse", "mint", "make_actionable", "insert_operator"]
@@ -231,7 +253,7 @@ policies = st.builds(
 # --- the oracle: each invariant's SPEC.md pass condition, checked directly ---
 
 
-def _snap(a: PolicyStore) -> dict[int, tuple[str, bool, bool]]:
+def _snap(a: PolicyStore) -> dict[int, tuple[str, bool, bool, str]]:
     return a.snapshot()
 
 
@@ -281,7 +303,9 @@ def spec_vl2(a: PolicyStore) -> bool:
     before = _snap(a)
     a.promote(ids[1], channel=c.OUT_OF_BAND)
     after = _snap(a)
-    if set(after) != set(before) or after[ids[1]][0] != c.OPERATOR:
+    # Only the target's label changes.
+    t = before[ids[1]]
+    if set(after) != set(before) or after[ids[1]] != (c.OPERATOR, t[1], t[2], t[3]):
         return False
     if any(after[i] != before[i] for i in before if i != ids[1]):
         return False
@@ -293,7 +317,9 @@ def spec_vl2(a: PolicyStore) -> bool:
     if a.activate(rid, channel=c.IN_BAND) is not True:
         return False
     after = _snap(a)
-    if set(after) != set(before) or not after[rid][1]:
+    # The target stays operator with its content intact; only actionable changes.
+    t = before[rid]
+    if set(after) != set(before) or after[rid] != (c.OPERATOR, True, t[2], t[3]):
         return False
     return all(after[i] == before[i] for i in before if i != rid)
 
@@ -330,9 +356,13 @@ def spec_vl4(a: PolicyStore) -> bool:
         for i in range(CAP + 3)
     ]
     a.prune()
-    survivors = set(a.snapshot())
-    if survivors != set(durable) | set(plain[-CAP:]) or not a.health_ok():
+    snap = a.snapshot()
+    if set(snap) != set(durable) | set(plain[-CAP:]) or not a.health_ok():
         return False
+    if any(
+        snap[d][2] is not True or snap[d][3] != f"d{i}" for i, d in enumerate(durable)
+    ):
+        return False  # a surviving durable record must stay durable and intact
     a.force_lose(durable[0])
     return a.health_ok() is False and a.durable_violations() > 0
 
@@ -551,6 +581,8 @@ LAUNDERING_STORES: dict[str, list[Policy]] = {
         replace(HONEST, promote_oob="insert_operator"),
         replace(HONEST, activate="insert_operator"),
         replace(HONEST, activate="gate_spill"),
+        # Round 3 review: activation that demotes the record it activates.
+        replace(HONEST, activate="activate_and_demote"),
     ],
     "VL-3": [replace(HONEST, envelope="agent_as_operator")],
     "VL-4": [replace(HONEST, health="always_ok")],
@@ -632,6 +664,7 @@ def test_suite_is_sound_for_vl1(policy: Policy) -> None:
 @example(policy=replace(HONEST, promote_oob="insert_operator"))
 @example(policy=replace(HONEST, activate="insert_operator"))
 @example(policy=replace(HONEST, activate="gate_spill"))
+@example(policy=replace(HONEST, activate="activate_and_demote"))
 def test_suite_is_sound_for_vl2(policy: Policy) -> None:
     _sound(policy, "VL-2")
 
@@ -651,7 +684,14 @@ def test_suite_is_sound_for_vl4(policy: Policy) -> None:
 ALL_POLICIES: list[Policy] = [
     Policy(cl, ac, pib, poob, born, env, pr, he)
     for cl in ("agent", "ingested", "none", "agent_plus_shadow")
-    for ac in ("gate", "allow", "block", "insert_operator", "gate_spill")
+    for ac in (
+        "gate",
+        "allow",
+        "block",
+        "insert_operator",
+        "gate_spill",
+        "activate_and_demote",
+    )
     for pib in ("refuse", "mint", "make_actionable", "insert_operator")
     for poob in ("exact", "all_records", "refuse", "insert_operator")
     for born in (False, True)
@@ -665,7 +705,7 @@ def test_suite_is_sound_and_complete_over_every_configurable_store() -> None:
     # Exhaustive, not sampled: every store in the family, every invariant.
     # Sound: the suite passes an invariant only if the spec oracle does.
     # Complete: the oracle accepting an invariant means the suite passes it.
-    assert len(ALL_POLICIES) == 15360
+    assert len(ALL_POLICIES) == 18432
     unsound: list[tuple[str, Policy]] = []
     incomplete: list[tuple[str, Policy]] = []
     for policy in ALL_POLICIES:
@@ -678,3 +718,116 @@ def test_suite_is_sound_and_complete_over_every_configurable_store() -> None:
                 incomplete.append((inv, policy))
     assert not unsound, unsound[:3]
     assert not incomplete, incomplete[:3]
+
+
+# --- adversarial pass over every state a probe reads (round 3 review) ---
+#
+# For each operation a probe exercises, one store changes one piece of state
+# the operation must leave alone: the target's label, actionability, payload or
+# durability, or another record. Each must fail exactly the invariant that
+# operation belongs to, and the spec oracle must reject it.
+
+
+class _ActivateRewritesPayload(PolicyStore):
+    def activate(self, record_id: int, *, channel: str) -> bool:
+        ok = super().activate(record_id, channel=channel)
+        if ok:
+            self.rows[record_id].payload = "rewritten"
+        return ok
+
+
+class _ActivateFlipsDurable(PolicyStore):
+    def activate(self, record_id: int, *, channel: str) -> bool:
+        ok = super().activate(record_id, channel=channel)
+        if ok:
+            self.rows[record_id].durable = not self.rows[record_id].durable
+        return ok
+
+
+class _ActivateTouchesBystander(PolicyStore):
+    def activate(self, record_id: int, *, channel: str) -> bool:
+        ok = super().activate(record_id, channel=channel)
+        for rid, row in self.rows.items():
+            if ok and rid != record_id:
+                row.payload = "touched"
+        return ok
+
+
+class _RefusedActivateRewritesPayload(PolicyStore):
+    def activate(self, record_id: int, *, channel: str) -> bool:
+        ok = super().activate(record_id, channel=channel)
+        if not ok:
+            self.rows[record_id].payload = "rewritten"
+        return ok
+
+
+class _RefusedPromoteFlipsDurable(PolicyStore):
+    def promote(self, record_id: int, *, channel: str) -> bool:
+        ok = super().promote(record_id, channel=channel)
+        if channel == c.IN_BAND:
+            self.rows[record_id].durable = not self.rows[record_id].durable
+        return ok
+
+
+class _PromoteAlsoActivates(PolicyStore):
+    def promote(self, record_id: int, *, channel: str) -> bool:
+        ok = super().promote(record_id, channel=channel)
+        if channel == c.OUT_OF_BAND:
+            self.rows[record_id].actionable = True
+        return ok
+
+
+class _PromoteRewritesPayload(PolicyStore):
+    def promote(self, record_id: int, *, channel: str) -> bool:
+        ok = super().promote(record_id, channel=channel)
+        if channel == c.OUT_OF_BAND:
+            self.rows[record_id].payload = "rewritten"
+        return ok
+
+
+class _PromoteFlipsDurable(PolicyStore):
+    def promote(self, record_id: int, *, channel: str) -> bool:
+        ok = super().promote(record_id, channel=channel)
+        if channel == c.OUT_OF_BAND:
+            self.rows[record_id].durable = not self.rows[record_id].durable
+        return ok
+
+
+class _PruneDemotesDurable(PolicyStore):
+    def prune(self) -> None:
+        super().prune()
+        for row in self.rows.values():
+            row.durable = False
+
+
+class _PruneRewritesDurable(PolicyStore):
+    def prune(self) -> None:
+        super().prune()
+        for row in self.rows.values():
+            if row.durable:
+                row.payload = "rewritten"
+
+
+@pytest.mark.parametrize(
+    ("invariant", "store_type"),
+    [
+        ("VL-2", _ActivateRewritesPayload),
+        ("VL-2", _ActivateFlipsDurable),
+        ("VL-2", _ActivateTouchesBystander),
+        ("VL-2", _RefusedActivateRewritesPayload),
+        ("VL-2", _RefusedPromoteFlipsDurable),
+        ("VL-2", _PromoteAlsoActivates),
+        ("VL-2", _PromoteRewritesPayload),
+        ("VL-2", _PromoteFlipsDurable),
+        ("VL-4", _PruneDemotesDurable),
+        ("VL-4", _PruneRewritesDurable),
+    ],
+    ids=lambda v: v if isinstance(v, str) else v.__name__.strip("_"),
+)
+def test_every_probed_state_change_fails_exactly_its_invariant(
+    invariant: str, store_type: type[PolicyStore]
+) -> None:
+    store = store_type(HONEST)
+    failed = {s.invariant for s in score_adapter(store).invariants if not s.passed}
+    assert failed == {invariant}
+    assert not SPEC[invariant](store_type(HONEST))

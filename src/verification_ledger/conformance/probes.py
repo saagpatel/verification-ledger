@@ -12,7 +12,7 @@ and returns True iff the store behaved correctly for that probe.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from verification_ledger.conformance.contract import (
     AGENT,
@@ -88,9 +88,21 @@ def _vl2_pos_operator_activates(a: LedgerAdapter) -> bool:
     # reflects it, not just the return value. Using the adapter's seed_operator
     # keeps this probe agnostic to how the store mints operator trust.
     rid = a.seed_operator("directive")
+    before = a.read(rid)
     activated = a.activate(rid, channel=IN_BAND)
     r = a.read(rid)
-    return activated is True and r is not None and r.actionable is True
+    # The activated record is still operator trust with its content intact: a
+    # store that demotes or rewrites the record it activates leaves an
+    # actionable non-operator (or altered) record behind.
+    return (
+        activated is True
+        and before is not None
+        and r is not None
+        and r.actionable is True
+        and r.source_trust == OPERATOR
+        and r.payload == before.payload
+        and r.durable == before.durable
+    )
 
 
 def _vl2_pos_out_of_band_promotion_makes_operator(a: LedgerAdapter) -> bool:
@@ -124,11 +136,21 @@ def _vl2_adv_agent_not_activatable_in_band(a: LedgerAdapter) -> bool:
 def _vl2_adv_operator_activation_is_exact(a: LedgerAdapter) -> bool:
     # The fast path must not spill: activating one operator record leaves every
     # other record, and the record set, exactly as it was.
+    # The target is checked too: only its actionable flag may change.
     others = _bystanders(a)
     rid = a.seed_operator("directive")
-    before = _state(a, others)
+    count_before, before = _state(a, [*others, rid])
     activated = a.activate(rid, channel=IN_BAND)
-    return activated is True and _state(a, others) == before
+    count_after, after = _state(a, [*others, rid])
+    target_before, target_after = before[-1], after[-1]
+    return (
+        activated is True
+        and count_after == count_before
+        and after[:-1] == before[:-1]
+        and target_before is not None
+        and target_after is not None
+        and target_after == replace(target_before, actionable=True)
+    )
 
 
 def _vl2_adv_record_not_born_actionable(a: LedgerAdapter) -> bool:
@@ -193,11 +215,17 @@ def _vl2_adv_out_of_band_promotion_is_exact(a: LedgerAdapter) -> bool:
     count_before, before = _state(a, ids)
     a.promote(ids[1], channel=OUT_OF_BAND)
     count_after, after = _state(a, ids)
-    target = after[1]
+    target, was = after[1], before[1]
+    # Only the target's label changes: not its actionability, content or
+    # durability (activation is a separate, gated transition).
     return (
         count_after == count_before
         and target is not None
+        and was is not None
         and target.source_trust == OPERATOR
+        and target.actionable == was.actionable
+        and target.payload == was.payload
+        and target.durable == was.durable
         and after[0] == before[0]
         and after[2] == before[2]
     )
@@ -277,7 +305,8 @@ def _vl4_adv_durable_survives_aggressive_prune(a: LedgerAdapter) -> bool:
     for i in range(cap + 3):
         a.write(f"n{i}", source_trust=AGENT, channel=IN_BAND, durable=False)
     a.prune()
-    return a.read(rid) is not None  # the durable record must remain
+    r = a.read(rid)  # the durable record must remain, still durable and intact
+    return r is not None and r.durable is True and r.payload == "shipped"
 
 
 def _vl4_adv_durable_loss_is_reported(a: LedgerAdapter) -> bool:

@@ -29,6 +29,11 @@ class StoredRecord:
     source_trust: str
     actionable: bool
     envelope: dict[str, str] | None
+    # The record's content and durability. The probes compare them wherever an
+    # operation must leave a record unchanged; an adapter that leaves them
+    # unset (None) fails those probes.
+    payload: str | None = None
+    durable: bool | None = None
 
 
 class LedgerAdapter(Protocol):

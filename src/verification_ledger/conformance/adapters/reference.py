@@ -60,6 +60,8 @@ class ReferenceAdapter:
             record_id=enveloped.record.id,
             source_trust=str(enveloped.record.source_trust),
             actionable=enveloped.record.actionable,
+            payload=enveloped.record.payload,
+            durable=enveloped.record.durable,
             envelope={
                 "kind": env["kind"],
                 "source_trust": env["source_trust"],

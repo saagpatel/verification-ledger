@@ -202,7 +202,13 @@ Each probe starts from `fresh()` and writes every record it later inspects, so
 it knows the store's complete record set. Wherever SPEC says an operation
 "mutates nothing" or touches "one exact record", the probe compares
 `count_records()` as well as every known record, so a store that refuses an
-operation but creates an operator record on the side does not pass.
+operation but creates an operator record on the side does not pass. A read
+(`StoredRecord`) exposes each record's label, actionability, envelope, payload
+and durability, and the probes compare all of them, the operation's own target
+included: an activation may change only the target's actionability (it must
+stay operator trust with its content intact), an out-of-band promotion only its
+label, and a prune must leave every surviving durable record durable and
+unchanged.
 
 The suite runs entirely against this protocol, so it grades the bundled reference
 implementation and any third-party store the same way. The suite is the standard;

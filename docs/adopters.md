@@ -85,7 +85,9 @@ recorded, in-band promotion must leave actionability and every other record
 untouched, out-of-band promotion must touch one exact record, an agent record's
 envelope must say `agent`, a forced durable loss must show up in health with
 a counter, and no write, activation or promotion may create records on the side,
-which the probes check with `count_records()` alongside every record they wrote), and the adapter protocol gained the hooks those checks need
+which the probes check with `count_records()` alongside every record they wrote;
+`StoredRecord` now also carries each record's `payload` and `durable`, which the
+probes compare, so an adapter must report them), and the adapter protocol gained the hooks those checks need
 (`clamp_recorded`, `durable_violations`, `force_durable_loss`, and an unlabeled
 `write`). bridge-db has not been re-graded against them here.
 

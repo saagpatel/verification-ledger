@@ -23,6 +23,7 @@ class _Row:
     trust: str
     actionable: bool
     durable: bool
+    payload: str = ""
 
 
 def _envelope(trust: str) -> dict[str, str]:
@@ -59,10 +60,17 @@ class _DoubleBase:
     def fresh(self) -> None:
         self.__init__()
 
-    def _store(self, trust: str, actionable: bool, durable: bool, clamped: bool) -> int:
+    def _store(
+        self,
+        trust: str,
+        actionable: bool,
+        durable: bool,
+        clamped: bool,
+        payload: str = "",
+    ) -> int:
         rid = self._next
         self._next += 1
-        self._rows[rid] = _Row(trust, actionable, durable)
+        self._rows[rid] = _Row(trust, actionable, durable, payload)
         if durable:
             self._receipts.add(rid)
         if clamped:
@@ -76,10 +84,17 @@ class _DoubleBase:
         row = self._rows.get(record_id)
         if row is None:
             return None
-        return StoredRecord(record_id, row.trust, row.actionable, _envelope(row.trust))
+        return StoredRecord(
+            record_id,
+            row.trust,
+            row.actionable,
+            _envelope(row.trust),
+            payload=row.payload,
+            durable=row.durable,
+        )
 
     def seed_operator(self, payload: str) -> int:
-        return self._store(c.OPERATOR, False, False, False)
+        return self._store(c.OPERATOR, False, False, False, payload=payload)
 
     def prune(self) -> None:
         _correct_prune(self._rows, _DOUBLE_CAP)
@@ -110,7 +125,9 @@ class _AllowEverythingAdapter(_DoubleBase):
     def write(
         self, payload: str, *, source_trust: str | None, channel: str, durable: bool
     ) -> int:
-        return self._store(source_trust or c.AGENT, False, durable, False)  # no clamp
+        return self._store(
+            source_trust or c.AGENT, False, durable, False, payload=payload
+        )  # no clamp
 
     def activate(self, record_id: int, *, channel: str) -> bool:
         self._rows[record_id].actionable = True
@@ -131,7 +148,7 @@ class _BlockEverythingAdapter(_DoubleBase):
         clamped = trust == c.OPERATOR and channel == c.IN_BAND
         if clamped:
             trust = c.AGENT  # correct clamp
-        return self._store(trust, False, durable, clamped)
+        return self._store(trust, False, durable, clamped, payload=payload)
 
     def activate(self, record_id: int, *, channel: str) -> bool:
         return False  # blocks the legitimate fast path too
@@ -155,10 +172,12 @@ class _BornActionableAdapter(_DoubleBase):
         clamped = trust == c.OPERATOR and channel == c.IN_BAND
         if clamped:
             trust = c.AGENT  # honest clamp
-        return self._store(trust, True, durable, clamped)  # BORN ACTIONABLE
+        return self._store(
+            trust, True, durable, clamped, payload=payload
+        )  # BORN ACTIONABLE
 
     def seed_operator(self, payload: str) -> int:
-        return self._store(c.OPERATOR, True, False, False)
+        return self._store(c.OPERATOR, True, False, False, payload=payload)
 
     def activate(self, record_id: int, *, channel: str) -> bool:
         return self._rows[record_id].trust == c.OPERATOR  # reports refused for agent
