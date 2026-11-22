@@ -110,6 +110,25 @@ never pass unnoticed.
 orphan or durable loss is reported by health with a non-zero counter under both
 failure policies.
 
+The reference store makes the evidence tamper-evident, not only present. Each
+durable record's receipt carries a SHA-256 digest of the record's content (id,
+payload, creation time) and a link hash over the previous receipt, and the
+store's metadata keeps the chain's length and head. Health re-verifies the
+chain and counts four kinds of violation separately: overwritten content
+(digest mismatch), a missing or demoted record, a durable record with no
+receipt, and a broken chain (a receipt removed or altered anywhere, including
+the newest one). Stores written before the chain existed are migrated when
+opened: receipts with no digest get one from their record's current content,
+and existing links are never recomputed.
+
+*Scope of detection:* the chain, its metadata and the records live in the same
+store, and the hash has no key. A writer with direct write access who changes
+records, receipts and metadata consistently (recomputing every digest and link
+after the change) leaves a store that verifies. Detecting that needs an anchor
+the writer cannot reach, such as the head hash recorded outside the store; the
+reference ships none. The migration also trusts the content it finds: an
+overwrite made before a store was migrated is not detectable afterwards.
+
 ## Conformance scoring
 
 The conformance suite runs, per invariant, a set of **positive probes** (the

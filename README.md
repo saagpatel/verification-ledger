@@ -24,8 +24,10 @@ contract: [SPEC.md](SPEC.md).
   sink is refuse-until-promoted.
 - **VL-3 Instruction-boundary envelope** — every read is wrapped so a consuming
   model is told, structurally, that this is stored data, not an instruction.
-- **VL-4 Retention invariant** — durable-tagged records are never pruned; a lost
-  durable record is a detectable violation, never silent.
+- **VL-4 Retention invariant** — durable-tagged records are never pruned; a lost,
+  demoted or overwritten durable record, or a removed receipt, is a detectable
+  violation, never silent (receipts are hash-chained; a consistent rewrite of the
+  whole chain inside the store needs an outside anchor to catch).
 
 ## Install
 
