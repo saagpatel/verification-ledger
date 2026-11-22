@@ -22,9 +22,17 @@ TLA2TOOLS=/path/to/tla2tools.jar specs/tla/run.sh            # every configurati
 TLA2TOOLS=/path/to/tla2tools.jar specs/tla/run.sh VerificationLedger
 ```
 
-`JAVA` overrides the java binary and `TLC_WORKERS` the worker count. Full TLC
-logs land in `specs/tla/out/` (ignored by git). The script exits non-zero if
-any configuration's result differs from its expectation.
+`JAVA` overrides the java binary, `TLC_WORKERS` the worker count and
+`TLC_HEAP` the Java heap cap per run (default `4g`). Full TLC logs land in
+`specs/tla/out/` (ignored by git). The script exits non-zero if any
+configuration's result differs from its expectation.
+
+CI runs TLC v1.7.4 (checksum-pinned). Every pull request checks the fast
+configurations: each counterexample control, `Witness_FastPath` and
+`Check_MetaErased`. The four long passing configurations (`VerificationLedger`,
+`Control_GateDecisionOnly`, `Control_PruneSelectionOnly` and
+`Finding_ReceiptErased`) run in the `TLC full` workflow, weekly and on demand,
+one job per configuration.
 
 ## Bounds
 
