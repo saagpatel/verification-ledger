@@ -8,6 +8,9 @@
 #   TLA2TOOLS    path to tla2tools.jar (required)
 #   JAVA         java binary (default: java on PATH)
 #   TLC_WORKERS  TLC worker threads (default: auto)
+#   TLC_HEAP     Java heap cap per run, as for -Xmx (default: 4g). Java also
+#                caps direct (off-heap) memory at this size, so a run stays
+#                near twice this figure instead of growing to a quarter of RAM.
 #
 # CONFIG is a .cfg basename (default: all of them). Full TLC logs go to
 # specs/tla/out/<CONFIG>.log. Exit status is non-zero if any result differs
@@ -17,6 +20,7 @@ set -euo pipefail
 : "${TLA2TOOLS:?set TLA2TOOLS to the path of tla2tools.jar}"
 java_bin="${JAVA:-java}"
 workers="${TLC_WORKERS:-auto}"
+heap="${TLC_HEAP:-4g}"
 
 here="$(cd "$(dirname "$0")" && pwd)"
 cd "$here"
@@ -61,7 +65,7 @@ status=0
 printf '%-32s %-26s %-26s %12s %10s %6s\n' CONFIG EXPECTED RESULT GENERATED DISTINCT DEPTH
 for name in "${configs[@]}"; do
     log="out/$name.log"
-    "$java_bin" -XX:+UseParallelGC -cp "$TLA2TOOLS" tlc2.TLC \
+    "$java_bin" -Xmx"$heap" -XX:+UseParallelGC -cp "$TLA2TOOLS" tlc2.TLC \
         -workers "$workers" -metadir "$meta/$name" \
         -config "$name.cfg" VerificationLedger.tla >"$log" 2>&1 || true
 
