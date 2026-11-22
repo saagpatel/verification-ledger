@@ -25,7 +25,10 @@ contract: [SPEC.md](SPEC.md).
 - **VL-3 Instruction-boundary envelope** — every read is wrapped so a consuming
   model is told, structurally, that this is stored data, not an instruction.
 - **VL-4 Retention invariant** — durable-tagged records are never pruned; a lost
-  durable record is a detectable violation, never silent.
+  durable record is a detectable violation, never silent. So are a demoted or
+  overwritten durable record and a removed receipt: receipts are hash-chained. A
+  consistent rewrite of the whole chain inside the store needs an outside anchor
+  to catch.
 
 ## Install
 

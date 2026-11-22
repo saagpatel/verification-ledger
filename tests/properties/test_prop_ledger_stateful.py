@@ -8,8 +8,9 @@ out-of-band promotions, retention passes, and adversarial attempts:
   ingested records on either channel, instruction-like payloads;
 - gate bypass: promotion with the default channel, operations on missing ids,
   negative prune caps;
-- retention tampering with store-level access: deleting or demoting a durable
-  row behind the API's back.
+- retention tampering with store-level access: deleting, demoting or
+  overwriting a record behind the API's back, and erasing a durable receipt
+  with or without its record.
 
 An independent model tracks what SPEC.md says the store must contain, and every
 invariant below is checked after every step:
@@ -23,8 +24,10 @@ invariant below is checked after every step:
   carries the exact envelope with the record's real trust; payloads come back
   verbatim and never alter the envelope.
 - VL-4: pruning removes exactly the non-durable records past the newest ``keep``
-  and never a durable one; any durable loss or demotion that leaves its receipt
-  is reported by ``health`` under both failure policies.
+  and never a durable one; health reports, under both failure policies and each
+  with its own counter, every durable loss or demotion, every overwritten
+  durable payload, every durable record without a receipt, and every removed
+  receipt (as a chain break).
 """
 
 from __future__ import annotations
@@ -32,7 +35,8 @@ from __future__ import annotations
 import logging
 import sqlite3
 from dataclasses import dataclass, replace
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import replace as dc_replace
 from typing import Any
 
 import pytest
@@ -48,6 +52,7 @@ from hypothesis.stateful import (
 
 from verification_ledger.envelope import BOUNDARY_KIND, BOUNDARY_WARNING
 from verification_ledger.gate import GateDecision
+from verification_ledger.integrity import IntegrityReport, verify
 from verification_ledger.invariants import FailurePolicy, InvariantViolation
 from verification_ledger.ledger import ActivationResult, Ledger, WriteResult
 from verification_ledger.model import Channel, Trust
@@ -84,6 +89,7 @@ class ModelRow:
     durable: bool
     actionable: bool
     oob_minted: bool  # ghost: operator trust was minted on the out-of-band channel
+    sealed: str | None = None  # ghost: a durable record's payload at write time
 
 
 class _ClampLog(logging.Handler):
@@ -120,6 +126,7 @@ class LedgerMachine(RuleBasedStateMachine):
         self.tools = in_band_tools(self.led)
         self.model: dict[int, ModelRow] = {}
         self.receipts: set[int] = set()
+        self.receipt_removed = False  # ghost: the tamper rules removed a receipt
         self.max_id = 0
         self.expected_clamps = 0
         self.clamp_log = _ClampLog()
@@ -160,6 +167,20 @@ class LedgerMachine(RuleBasedStateMachine):
             1 for r in self.receipts if r not in self.model or not self.model[r].durable
         )
 
+    def _overwritten(self) -> int:
+        return sum(
+            1
+            for r in self.receipts
+            if r in self.model
+            and self.model[r].durable
+            and self.model[r].payload != self.model[r].sealed
+        )
+
+    def _unreceipted(self) -> int:
+        return sum(
+            1 for r, row in self.model.items() if row.durable and r not in self.receipts
+        )
+
     def _record_write(
         self,
         rid: int,
@@ -179,6 +200,7 @@ class LedgerMachine(RuleBasedStateMachine):
             durable=durable,
             actionable=False,  # never born actionable
             oob_minted=trust is Trust.OPERATOR and channel is Channel.OUT_OF_BAND,
+            sealed=payload if durable else None,
         )
         if durable:
             self.receipts.add(rid)
@@ -411,6 +433,40 @@ class LedgerMachine(RuleBasedStateMachine):
         self.model[rid] = replace(self.model[rid], durable=False)
         note(f"tamper: demoted durable record {rid}")
 
+    @precondition(lambda self: bool(self.model))
+    @rule(index=INDEX, payload=PAYLOADS)
+    def adversary_overwrite_row(self, index: int, payload: str) -> None:
+        # Store-level tamper: rewrite any record's payload in place. For a
+        # durable record this must surface as an overwritten digest; a
+        # non-durable record has no receipt and VL-4 makes no claim about it.
+        rid = self._pick(index)
+        self.conn.execute("UPDATE records SET payload = ? WHERE id = ?", (payload, rid))
+        self.conn.commit()
+        self.model[rid] = replace(self.model[rid], payload=payload)
+        note(f"tamper: overwrote record {rid}")
+
+    def _receipted_durable(self) -> list[int]:
+        return sorted(
+            r for r, row in self.model.items() if row.durable and r in self.receipts
+        )
+
+    @precondition(lambda self: bool(self._receipted_durable()))
+    @rule(index=INDEX, with_row=st.booleans())
+    def adversary_erase_receipt(self, index: int, with_row: bool) -> None:
+        # Store-level tamper that also removes the evidence: delete a durable
+        # record's receipt, with or without the record itself, anywhere in the
+        # chain (including the newest receipt).
+        candidates = self._receipted_durable()
+        rid = candidates[index % len(candidates)]
+        if with_row:
+            self.conn.execute("DELETE FROM records WHERE id = ?", (rid,))
+            del self.model[rid]
+        self.conn.execute("DELETE FROM durable_receipts WHERE record_id = ?", (rid,))
+        self.conn.commit()
+        self.receipts.discard(rid)
+        self.receipt_removed = True
+        note(f"tamper: erased receipt {rid} (row too: {with_row})")
+
     # --- invariants, checked after every step ---
 
     @invariant()
@@ -475,21 +531,28 @@ class LedgerMachine(RuleBasedStateMachine):
         assert self.clamp_log.count == self.expected_clamps
 
     @invariant()
-    def receipts_are_append_only(self) -> None:
+    def receipts_change_only_by_tamper(self) -> None:
         rows = self.conn.execute("SELECT record_id FROM durable_receipts").fetchall()
         assert {int(r[0]) for r in rows} == self.receipts
 
     @invariant()
     def health_detects_every_durable_loss(self) -> None:
         orphans = self._orphans()
-        if self.policy is FailurePolicy.RAISE and orphans:
-            with pytest.raises(InvariantViolation, match=f"VL-4: {orphans} durable"):
+        overwritten = self._overwritten()
+        unreceipted = self._unreceipted()
+        bad = bool(orphans or overwritten or unreceipted or self.receipt_removed)
+        if self.policy is FailurePolicy.RAISE and bad:
+            match = f"VL-4: {orphans} durable" if orphans else "VL-4: "
+            with pytest.raises(InvariantViolation, match=match):
                 self.led.health()
             return
         h = self.led.health()
-        assert h.ok is (orphans == 0)
+        assert h.ok is (not bad)
         assert h.durable_orphans == orphans
-        assert bool(h.violations) is (orphans > 0)
+        assert h.digest_mismatches == overwritten
+        assert h.missing_receipts == unreceipted
+        assert (h.chain_breaks > 0) is self.receipt_removed
+        assert bool(h.violations) is bad
         assert h.total == len(self.model)
         assert h.durable_protected == sum(1 for r in self.model.values() if r.durable)
         assert h.prunable == h.total - h.durable_protected
@@ -549,17 +612,28 @@ _CONTROL_SETTINGS = settings(
 )
 
 
+def _verify_ignoring(counter: str) -> Callable[..., IntegrityReport]:
+    def mutant(*args: Any) -> IntegrityReport:
+        return dc_replace(verify(*args), **{counter: 0})
+
+    return mutant
+
+
 @pytest.mark.parametrize(
     ("target", "replacement"),
     [
         ("verification_ledger.ledger.Ledger.activate", _unguarded_activate),
         ("verification_ledger.ledger.evaluate_promotion", _allow_everything),
         ("verification_ledger.ledger.select_prunable", _select_everything),
+        ("verification_ledger.ledger.verify", _verify_ignoring("digest_mismatches")),
+        ("verification_ledger.ledger.verify", _verify_ignoring("chain_breaks")),
     ],
     ids=[
         "gate-skips-its-check",
         "promotion-ignores-channel",
         "prune-selects-durable",
+        "health-ignores-digests",
+        "health-ignores-the-chain",
     ],
 )
 def test_machine_catches_mutant(

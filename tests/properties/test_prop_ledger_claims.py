@@ -4,8 +4,8 @@ The stateful machine in ``test_prop_ledger_stateful.py`` covers the four
 invariants under random interleavings. This file covers what an interleaving
 cannot reach on its own: the pure retention selection, the failure-policy
 monitor, the out-of-band promotion CLI against a file store, the shape of the
-in-band MCP surface, the README quickstart, and the store-level attacks the
-health check does not detect (pinned as strict xfails with their counterexample).
+in-band MCP surface, and the README quickstart. Store-level attacks on durable
+records are in ``test_prop_durable_integrity.py``.
 """
 
 from __future__ import annotations
@@ -236,69 +236,3 @@ def test_readme_quickstart_holds_for_any_payload(payload: str) -> None:
     env = led.read(r.record_id)
     assert env is not None and env.envelope["kind"] == BOUNDARY_KIND
     led.close()
-
-
-# --- VL-4: store-level attacks the health check does not detect ---
-#
-# The VL-4 detection mechanism is a receipt per durable record, cross-checked by
-# health(). Any loss that leaves the receipt behind is detected (see the
-# stateful machine's tamper rules). Two store-level attacks are not.
-
-
-def _durable_store(policy: FailurePolicy) -> tuple[Ledger, sqlite3.Connection, int]:
-    led = Ledger(policy=policy)
-    rid = led.write("shipped artifact", durable=True).record_id
-    conn: sqlite3.Connection = led._conn  # pyright: ignore[reportPrivateUsage]
-    return led, conn, rid
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "VL-4 'never a silent corruption' / SPEC 'overwritten ... nothing detects': "
-        "counterexample: write('shipped artifact', durable=True) -> id 1; "
-        "UPDATE records SET payload='forged' WHERE id=1; health() -> ok=True, "
-        "durable_orphans=0. Receipts record existence only, not content."
-    ),
-)
-@given(policy=POLICIES, forged=st.text(max_size=20))
-@example(policy=FailurePolicy.REPORT, forged="forged")
-def test_rewrite_of_a_durable_record_is_detected(
-    policy: FailurePolicy, forged: str
-) -> None:
-    led, conn, rid = _durable_store(policy)
-    conn.execute("UPDATE records SET payload = ? WHERE id = ?", (forged, rid))
-    conn.commit()
-    try:
-        health = led.health()
-    except InvariantViolation:
-        return  # detected (RAISE)
-    finally:
-        led.close()
-    assert health.ok is False  # detected (REPORT)
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "VL-4 'a lost durable record is a detectable violation': counterexample: "
-        "write('shipped artifact', durable=True) -> id 1; DELETE FROM records "
-        "WHERE id=1; DELETE FROM durable_receipts WHERE record_id=1; health() -> "
-        "ok=True, durable_orphans=0. The receipt lives in the same store, so a "
-        "writer that removes both erases the evidence."
-    ),
-)
-@given(policy=POLICIES)
-@example(policy=FailurePolicy.REPORT)
-def test_durable_loss_with_its_receipt_is_detected(policy: FailurePolicy) -> None:
-    led, conn, rid = _durable_store(policy)
-    conn.execute("DELETE FROM records WHERE id = ?", (rid,))
-    conn.execute("DELETE FROM durable_receipts WHERE record_id = ?", (rid,))
-    conn.commit()
-    try:
-        health = led.health()
-    except InvariantViolation:
-        return
-    finally:
-        led.close()
-    assert health.ok is False
