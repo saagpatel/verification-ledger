@@ -83,8 +83,9 @@ That result was graded against the first version of the probes. The probes
 have since been tightened (the clamp must land on exactly `agent` and be
 recorded, in-band promotion must leave actionability and every other record
 untouched, out-of-band promotion must touch one exact record, an agent record's
-envelope must say `agent`, and a forced durable loss must show up in health with
-a counter), and the adapter protocol gained the hooks those checks need
+envelope must say `agent`, a forced durable loss must show up in health with
+a counter, and no write, activation or promotion may create records on the side,
+which the probes check with `count_records()` alongside every record they wrote), and the adapter protocol gained the hooks those checks need
 (`clamp_recorded`, `durable_violations`, `force_durable_loss`, and an unlabeled
 `write`). bridge-db has not been re-graded against them here.
 

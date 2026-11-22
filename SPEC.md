@@ -189,6 +189,12 @@ read alone cannot show, again in the store's own terms:
   the API the way housekeeping SQL or a crash would. The VL-4 adversarial probe
   forces a loss and requires health to report it with a non-zero counter.
 
+Each probe starts from `fresh()` and writes every record it later inspects, so
+it knows the store's complete record set. Wherever SPEC says an operation
+"mutates nothing" or touches "one exact record", the probe compares
+`count_records()` as well as every known record, so a store that refuses an
+operation but creates an operator record on the side does not pass.
+
 The suite runs entirely against this protocol, so it grades the bundled reference
 implementation and any third-party store the same way. The suite is the standard;
 the reference implementation is one conformant store. A worked second adapter —

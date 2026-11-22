@@ -40,31 +40,42 @@ class Probe:
 # --- VL-1: provenance typing ---
 
 
+# Every probe starts on a fresh store and writes every record it later checks,
+# so it knows the complete record set: comparing count_records() alongside the
+# known ids catches any record an operation creates on the side.
+
+
+def _single_write(
+    a: LedgerAdapter, trust: str | None
+) -> tuple[int, StoredRecord | None]:
+    rid = a.write("x", source_trust=trust, channel=IN_BAND, durable=False)
+    if a.count_records() != 1:
+        return rid, None  # the write created more than the one record
+    return rid, a.read(rid)
+
+
 def _vl1_pos_agent_stored(a: LedgerAdapter) -> bool:
-    rid = a.write("x", source_trust=AGENT, channel=IN_BAND, durable=False)
-    r = a.read(rid)
+    rid, r = _single_write(a, AGENT)
     return r is not None and r.source_trust == AGENT and not a.clamp_recorded(rid)
 
 
 def _vl1_pos_ingested_stored(a: LedgerAdapter) -> bool:
-    rid = a.write("x", source_trust=INGESTED, channel=IN_BAND, durable=False)
-    r = a.read(rid)
+    rid, r = _single_write(a, INGESTED)
     return r is not None and r.source_trust == INGESTED and not a.clamp_recorded(rid)
 
 
 def _vl1_pos_no_label_defaults_to_agent(a: LedgerAdapter) -> bool:
     # SPEC VL-1: "a record with no label defaults to agent".
-    rid = a.write("x", source_trust=None, channel=IN_BAND, durable=False)
-    r = a.read(rid)
+    rid, r = _single_write(a, None)
     return r is not None and r.source_trust == AGENT and not a.clamp_recorded(rid)
 
 
 def _vl1_adv_in_band_operator_clamped(a: LedgerAdapter) -> bool:
     # The attack: mint operator trust from the in-band channel. SPEC VL-1 says
     # it is clamped to exactly ``agent`` and the clamp is recorded; a store that
-    # silently relabels it (to anything) has not implemented the clamp.
-    rid = a.write("x", source_trust=OPERATOR, channel=IN_BAND, durable=False)
-    r = a.read(rid)
+    # silently relabels it (to anything), or that clamps it but stores an
+    # operator copy on the side, has not implemented the clamp.
+    rid, r = _single_write(a, OPERATOR)
     return r is not None and r.source_trust == AGENT and a.clamp_recorded(rid)
 
 
@@ -89,13 +100,35 @@ def _vl2_pos_out_of_band_promotion_makes_operator(a: LedgerAdapter) -> bool:
     return r is not None and r.source_trust == OPERATOR
 
 
-def _vl2_adv_agent_not_activatable_in_band(a: LedgerAdapter) -> bool:
+def _in_band_activation_refused(a: LedgerAdapter, trust: str) -> bool:
     # Check persisted state, not only the return: a store that reports "refused"
-    # while the record is actually actionable is laundering.
-    rid = a.write("work", source_trust=AGENT, channel=IN_BAND, durable=False)
+    # while the record is actually actionable is laundering. SPEC VL-2: the
+    # refusal mutates nothing, so the complete record set is compared too.
+    others = _bystanders(a)
+    rid = a.write("work", source_trust=trust, channel=IN_BAND, durable=False)
+    before = _state(a, [*others, rid])
     activated = a.activate(rid, channel=IN_BAND)
     r = a.read(rid)
-    return activated is False and r is not None and r.actionable is False
+    return (
+        activated is False
+        and r is not None
+        and r.actionable is False
+        and _state(a, [*others, rid]) == before
+    )
+
+
+def _vl2_adv_agent_not_activatable_in_band(a: LedgerAdapter) -> bool:
+    return _in_band_activation_refused(a, AGENT)
+
+
+def _vl2_adv_operator_activation_is_exact(a: LedgerAdapter) -> bool:
+    # The fast path must not spill: activating one operator record leaves every
+    # other record, and the record set, exactly as it was.
+    others = _bystanders(a)
+    rid = a.seed_operator("directive")
+    before = _state(a, others)
+    activated = a.activate(rid, channel=IN_BAND)
+    return activated is True and _state(a, others) == before
 
 
 def _vl2_adv_record_not_born_actionable(a: LedgerAdapter) -> bool:
@@ -107,8 +140,10 @@ def _vl2_adv_record_not_born_actionable(a: LedgerAdapter) -> bool:
     return r is not None and r.actionable is False
 
 
-def _snapshot(a: LedgerAdapter, ids: list[int]) -> list[StoredRecord | None]:
-    return [a.read(rid) for rid in ids]
+def _state(a: LedgerAdapter, ids: list[int]) -> tuple[int, list[StoredRecord | None]]:
+    """The complete record set as far as the probe can see it: the count, plus
+    every record the probe wrote. On a fresh store those are all the records."""
+    return a.count_records(), [a.read(rid) for rid in ids]
 
 
 def _bystanders(a: LedgerAdapter) -> list[int]:
@@ -124,16 +159,18 @@ def _in_band_promotion_refused(a: LedgerAdapter, trust: str) -> bool:
     # SPEC VL-2: an in-band promotion attempt is refused and mutates nothing.
     # Persisted state, not just the label: a store whose in-band promote() makes
     # the record actionable while leaving it labeled agent is laundering.
+    # The complete record set is compared, so a store that refuses the
+    # promotion but mints a new operator record on the side is caught too.
     others = _bystanders(a)
     rid = a.write("work", source_trust=trust, channel=IN_BAND, durable=False)
-    before = _snapshot(a, [*others, rid])
+    before = _state(a, [*others, rid])
     a.promote(rid, channel=IN_BAND)
     r = a.read(rid)
     return (
         r is not None
         and r.source_trust == trust
         and r.actionable is False
-        and _snapshot(a, [*others, rid]) == before
+        and _state(a, [*others, rid]) == before
     )
 
 
@@ -147,17 +184,19 @@ def _vl2_adv_ingested_not_promotable_in_band(a: LedgerAdapter) -> bool:
 
 def _vl2_adv_out_of_band_promotion_is_exact(a: LedgerAdapter) -> bool:
     # SPEC VL-2: the ceremony is "applied to one exact record". Promoting the
-    # middle of three records must leave the other two exactly as they were.
+    # middle of three records must leave the other two exactly as they were
+    # and must not add a record.
     ids = [
         a.write(f"w{i}", source_trust=AGENT, channel=IN_BAND, durable=False)
         for i in range(3)
     ]
-    before = _snapshot(a, ids)
+    count_before, before = _state(a, ids)
     a.promote(ids[1], channel=OUT_OF_BAND)
-    after = _snapshot(a, ids)
+    count_after, after = _state(a, ids)
     target = after[1]
     return (
-        target is not None
+        count_after == count_before
+        and target is not None
         and target.source_trust == OPERATOR
         and after[0] == before[0]
         and after[2] == before[2]
@@ -165,10 +204,7 @@ def _vl2_adv_out_of_band_promotion_is_exact(a: LedgerAdapter) -> bool:
 
 
 def _vl2_adv_ingested_not_activatable_in_band(a: LedgerAdapter) -> bool:
-    rid = a.write("scraped", source_trust=INGESTED, channel=IN_BAND, durable=False)
-    activated = a.activate(rid, channel=IN_BAND)
-    r = a.read(rid)
-    return activated is False and r is not None and r.actionable is False
+    return _in_band_activation_refused(a, INGESTED)
 
 
 # --- VL-3: instruction-boundary envelope ---
@@ -322,6 +358,12 @@ def all_probes() -> list[Probe]:
             "adversarial",
             "out-of-band promotion touches one exact record",
             _vl2_adv_out_of_band_promotion_is_exact,
+        ),
+        Probe(
+            "VL-2",
+            "adversarial",
+            "operator activation touches one exact record",
+            _vl2_adv_operator_activation_is_exact,
         ),
         Probe(
             "VL-3", "positive", "read carries the envelope", _vl3_pos_envelope_present

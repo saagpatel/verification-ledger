@@ -37,10 +37,10 @@ CAP = 3
 TRUSTS = (c.OPERATOR, c.AGENT, c.INGESTED)
 CHANNELS = (c.IN_BAND, c.OUT_OF_BAND)
 
-Clamp = Literal["agent", "ingested", "none"]
-Activate = Literal["gate", "allow", "block"]
-PromoteInBand = Literal["refuse", "mint", "make_actionable"]
-PromoteOob = Literal["exact", "all_records", "refuse"]
+Clamp = Literal["agent", "ingested", "none", "agent_plus_shadow"]
+Activate = Literal["gate", "allow", "block", "insert_operator", "gate_spill"]
+PromoteInBand = Literal["refuse", "mint", "make_actionable", "insert_operator"]
+PromoteOob = Literal["exact", "all_records", "refuse", "insert_operator"]
 EnvelopeMode = Literal["honest", "agent_as_operator", "operator_label", "missing"]
 PruneMode = Literal["correct", "drop_durable", "noop"]
 HealthMode = Literal["honest", "always_ok"]
@@ -92,17 +92,26 @@ class PolicyStore:
         trust = c.AGENT if source_trust is None else source_trust
         relabeled = False
         if trust == c.OPERATOR and channel == c.IN_BAND:
-            trust = {"agent": c.AGENT, "ingested": c.INGESTED, "none": c.OPERATOR}[
-                self.policy.clamp
-            ]
+            trust = {
+                "agent": c.AGENT,
+                "ingested": c.INGESTED,
+                "none": c.OPERATOR,
+                "agent_plus_shadow": c.AGENT,
+            }[self.policy.clamp]
             relabeled = trust != c.OPERATOR
+        rid = self._insert(trust, durable)
+        if relabeled:
+            self.clamped.add(rid)
+            if self.policy.clamp == "agent_plus_shadow":
+                self._insert(c.OPERATOR, False)  # an operator copy on the side
+        return rid
+
+    def _insert(self, trust: str, durable: bool) -> int:
         rid = self.next_id
         self.next_id += 1
         self.rows[rid] = _Row(trust, self.policy.born_actionable, durable)
         if durable:
             self.receipts.add(rid)
-        if relabeled:
-            self.clamped.add(rid)
         return rid
 
     def clamp_recorded(self, record_id: int) -> bool:
@@ -133,6 +142,11 @@ class PolicyStore:
             return False
         if row.trust == c.OPERATOR:
             row.actionable = True
+            if self.policy.activate == "gate_spill":
+                for other in self.rows.values():
+                    other.actionable = True
+        elif self.policy.activate == "insert_operator":
+            self._insert(c.OPERATOR, False)  # refuses, but mints a record
         return row.actionable
 
     def promote(self, record_id: int, *, channel: str) -> bool:
@@ -142,8 +156,12 @@ class PolicyStore:
                 row.trust = c.OPERATOR
             elif self.policy.promote_in_band == "make_actionable":
                 row.actionable = True
-        elif self.policy.promote_oob == "exact":
+            elif self.policy.promote_in_band == "insert_operator":
+                self._insert(c.OPERATOR, False)  # refuses, but mints a record
+        elif self.policy.promote_oob in ("exact", "insert_operator"):
             row.trust = c.OPERATOR
+            if self.policy.promote_oob == "insert_operator":
+                self._insert(c.OPERATOR, False)
         elif self.policy.promote_oob == "all_records":
             for other in self.rows.values():
                 other.trust = c.OPERATOR
@@ -193,10 +211,14 @@ class PolicyStore:
 
 policies = st.builds(
     Policy,
-    clamp=st.sampled_from(["agent", "ingested", "none"]),
-    activate=st.sampled_from(["gate", "allow", "block"]),
-    promote_in_band=st.sampled_from(["refuse", "mint", "make_actionable"]),
-    promote_oob=st.sampled_from(["exact", "all_records", "refuse"]),
+    clamp=st.sampled_from(["agent", "ingested", "none", "agent_plus_shadow"]),
+    activate=st.sampled_from(
+        ["gate", "allow", "block", "insert_operator", "gate_spill"]
+    ),
+    promote_in_band=st.sampled_from(
+        ["refuse", "mint", "make_actionable", "insert_operator"]
+    ),
+    promote_oob=st.sampled_from(["exact", "all_records", "refuse", "insert_operator"]),
     born_actionable=st.booleans(),
     envelope=st.sampled_from(
         ["honest", "agent_as_operator", "operator_label", "missing"]
@@ -220,6 +242,8 @@ def spec_vl1(a: PolicyStore) -> bool:
         for channel in CHANNELS:
             a.fresh()
             rid = a.write("x", source_trust=trust, channel=channel, durable=False)
+            if set(a.snapshot()) != {rid}:
+                return False  # a write must create exactly its own record
             r = a.read(rid)
             clamp = trust == c.OPERATOR and channel == c.IN_BAND
             expected = c.AGENT if (trust is None or clamp) else trust
@@ -257,14 +281,21 @@ def spec_vl2(a: PolicyStore) -> bool:
     before = _snap(a)
     a.promote(ids[1], channel=c.OUT_OF_BAND)
     after = _snap(a)
-    if after[ids[1]][0] != c.OPERATOR:
+    if set(after) != set(before) or after[ids[1]][0] != c.OPERATOR:
         return False
-    if any(after[i] != before[i] for i in (ids[0], ids[2])):
+    if any(after[i] != before[i] for i in before if i != ids[1]):
         return False
     a.fresh()
+    for other in TRUSTS:
+        a.write("b", source_trust=other, channel=c.OUT_OF_BAND, durable=False)
     rid = a.seed_operator("directive")
-    r = a.read(rid) if a.activate(rid, channel=c.IN_BAND) else None
-    return r is not None and r.actionable
+    before = _snap(a)
+    if a.activate(rid, channel=c.IN_BAND) is not True:
+        return False
+    after = _snap(a)
+    if set(after) != set(before) or not after[rid][1]:
+        return False
+    return all(after[i] == before[i] for i in before if i != rid)
 
 
 def spec_vl3(a: PolicyStore) -> bool:
@@ -508,10 +539,18 @@ def _sound(policy: Policy, inv: str) -> None:
 # properties, and as direct tests that each now fails exactly its invariant.
 
 LAUNDERING_STORES: dict[str, list[Policy]] = {
-    "VL-1": [replace(HONEST, clamp="ingested")],
+    "VL-1": [
+        replace(HONEST, clamp="ingested"),
+        # Round 2 review: side records the first tightened probes did not see.
+        replace(HONEST, clamp="agent_plus_shadow"),
+    ],
     "VL-2": [
         replace(HONEST, promote_in_band="make_actionable"),
         replace(HONEST, promote_oob="all_records"),
+        replace(HONEST, promote_in_band="insert_operator"),
+        replace(HONEST, promote_oob="insert_operator"),
+        replace(HONEST, activate="insert_operator"),
+        replace(HONEST, activate="gate_spill"),
     ],
     "VL-3": [replace(HONEST, envelope="agent_as_operator")],
     "VL-4": [replace(HONEST, health="always_ok")],
@@ -573,7 +612,7 @@ class _UncountedLoss(PolicyStore):
 def test_other_pass_condition_breaks_fail_exactly_their_invariant(
     invariant: str, store: PolicyStore
 ) -> None:
-    # Parts of the pass conditions the 3888-store family does not vary.
+    # Parts of the pass conditions the configurable-store family does not vary.
     failed = {s.invariant for s in score_adapter(store).invariants if not s.passed}
     assert failed == {invariant}
     assert not SPEC[invariant](store)
@@ -581,6 +620,7 @@ def test_other_pass_condition_breaks_fail_exactly_their_invariant(
 
 @given(policy=policies)
 @example(policy=replace(HONEST, clamp="ingested"))
+@example(policy=replace(HONEST, clamp="agent_plus_shadow"))
 def test_suite_is_sound_for_vl1(policy: Policy) -> None:
     _sound(policy, "VL-1")
 
@@ -588,6 +628,10 @@ def test_suite_is_sound_for_vl1(policy: Policy) -> None:
 @given(policy=policies)
 @example(policy=replace(HONEST, promote_in_band="make_actionable"))
 @example(policy=replace(HONEST, promote_oob="all_records"))
+@example(policy=replace(HONEST, promote_in_band="insert_operator"))
+@example(policy=replace(HONEST, promote_oob="insert_operator"))
+@example(policy=replace(HONEST, activate="insert_operator"))
+@example(policy=replace(HONEST, activate="gate_spill"))
 def test_suite_is_sound_for_vl2(policy: Policy) -> None:
     _sound(policy, "VL-2")
 
@@ -602,3 +646,35 @@ def test_suite_is_sound_for_vl3(policy: Policy) -> None:
 @example(policy=replace(HONEST, health="always_ok"))
 def test_suite_is_sound_for_vl4(policy: Policy) -> None:
     _sound(policy, "VL-4")
+
+
+ALL_POLICIES: list[Policy] = [
+    Policy(cl, ac, pib, poob, born, env, pr, he)
+    for cl in ("agent", "ingested", "none", "agent_plus_shadow")
+    for ac in ("gate", "allow", "block", "insert_operator", "gate_spill")
+    for pib in ("refuse", "mint", "make_actionable", "insert_operator")
+    for poob in ("exact", "all_records", "refuse", "insert_operator")
+    for born in (False, True)
+    for env in ("honest", "agent_as_operator", "operator_label", "missing")
+    for pr in ("correct", "drop_durable", "noop")
+    for he in ("honest", "always_ok")
+]
+
+
+def test_suite_is_sound_and_complete_over_every_configurable_store() -> None:
+    # Exhaustive, not sampled: every store in the family, every invariant.
+    # Sound: the suite passes an invariant only if the spec oracle does.
+    # Complete: the oracle accepting an invariant means the suite passes it.
+    assert len(ALL_POLICIES) == 15360
+    unsound: list[tuple[str, Policy]] = []
+    incomplete: list[tuple[str, Policy]] = []
+    for policy in ALL_POLICIES:
+        passes = suite_passes(policy)
+        for inv, check in SPEC.items():
+            truth = check(PolicyStore(policy))
+            if passes[inv] and not truth:
+                unsound.append((inv, policy))
+            if truth and not passes[inv]:
+                incomplete.append((inv, policy))
+    assert not unsound, unsound[:3]
+    assert not incomplete, incomplete[:3]
