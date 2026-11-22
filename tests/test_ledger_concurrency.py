@@ -27,7 +27,7 @@ from verification_ledger.gate import (
 )
 from verification_ledger.integrity import LiveRecord, Receipt, relink
 from verification_ledger.invariants import FailurePolicy
-from verification_ledger.ledger import Ledger
+from verification_ledger.ledger import Ledger, PromotionResult
 from verification_ledger.model import Channel, Trust
 from verification_ledger.retention import RetentionCandidate, select_prunable
 
@@ -160,3 +160,28 @@ def test_migration_holds_the_write_lock(
     with Ledger(db, policy=FailurePolicy.REPORT) as led:
         assert led.health().ok
     assert locked == [True]
+
+
+def test_promotion_cli_reports_a_record_pruned_by_another_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The CLI used to read the record, then promote it in a second call; a
+    # prune by another process in between crashed it with a KeyError.
+    from verification_ledger.promote import promote as promote_cli
+
+    db = tmp_path / "fleet.db"
+    with Ledger(db) as led:
+        rid = led.write("gone soon").record_id
+    original = Ledger.promote
+
+    def prune_then_promote(
+        self: Ledger, record_id: int, *, channel: Channel = Channel.IN_BAND
+    ) -> PromotionResult:
+        # Another process prunes the record just before the promotion runs.
+        with Ledger(db) as other:
+            other.prune(keep=0)
+        return original(self, record_id, channel=channel)
+
+    monkeypatch.setattr(Ledger, "promote", prune_then_promote)
+    assert promote_cli(str(db), rid) == 1
+    assert "no record" in capsys.readouterr().out
