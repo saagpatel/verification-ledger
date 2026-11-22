@@ -34,8 +34,11 @@ expected() {
         Control_NoClamp) echo "VL1_Clamp|VL1_OperatorOnlyOutOfBand" ;;
         Control_PromotionIgnoresChannel) echo "VL1_OperatorOnlyOutOfBand" ;;
         Control_PruneSelectionOnly) echo "pass" ;;
-        Control_PruneIgnoresDurable) echo "VL4_DurableKept" ;;
-        Finding_ReceiptErased) echo "VL4_LossDetected" ;;
+        Control_PruneIgnoresDurable) echo "VL4_DurableKept|VL4_NoFalseAlarm" ;;
+        Control_HealthIgnoresDigest) echo "VL4_LossDetected" ;;
+        Control_HealthIgnoresChainMeta) echo "VL4_LossDetected" ;;
+        Control_ConsistentChainRewrite) echo "VL4_LossDetected" ;;
+        Finding_ReceiptErased) echo "pass" ;;
         Witness_FastPath) echo "NoRecordEverActionable" ;;
         *) echo "unknown" ;;
     esac
@@ -47,7 +50,8 @@ else
     configs=(VerificationLedger Control_GateDecisionOnly Control_GateSkipsCheck
              Control_NoClamp Control_PromotionIgnoresChannel
              Control_PruneSelectionOnly Control_PruneIgnoresDurable
-             Finding_ReceiptErased Witness_FastPath)
+             Control_HealthIgnoresDigest Control_HealthIgnoresChainMeta
+             Control_ConsistentChainRewrite Finding_ReceiptErased Witness_FastPath)
 fi
 
 status=0
