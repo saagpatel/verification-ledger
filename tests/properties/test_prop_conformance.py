@@ -11,9 +11,10 @@ Three kinds of claim are tested here:
    A family of configurable stores, each a mix of honest and broken mechanisms,
    is graded twice: once by the suite, and once by an independent oracle that
    checks each invariant's SPEC.md pass condition directly. Completeness (a store
-   the oracle accepts passes the suite) holds. Soundness (a store the suite passes
-   satisfies the spec) does not: for every invariant there is a store that scores
-   PASS while violating it. Those are strict xfails pinned with the minimal store.
+   the oracle accepts passes the suite) and soundness (a store the suite passes
+   satisfies the spec) both hold over the whole family. Soundness first failed
+   for every invariant; the probes were tightened, and each former 1.00-scoring
+   laundering store is pinned as a case that now fails exactly its invariant.
 """
 
 from __future__ import annotations
@@ -76,27 +77,36 @@ class PolicyStore:
     policy: Policy
     rows: dict[int, _Row] = field(default_factory=lambda: {})
     receipts: set[int] = field(default_factory=lambda: set())
+    clamped: set[int] = field(default_factory=lambda: set())
     next_id: int = 1
 
     def fresh(self) -> None:
         self.rows = {}
         self.receipts = set()
+        self.clamped = set()
         self.next_id = 1
 
     def write(
-        self, payload: str, *, source_trust: str, channel: str, durable: bool
+        self, payload: str, *, source_trust: str | None, channel: str, durable: bool
     ) -> int:
-        trust = source_trust
-        if source_trust == c.OPERATOR and channel == c.IN_BAND:
+        trust = c.AGENT if source_trust is None else source_trust
+        relabeled = False
+        if trust == c.OPERATOR and channel == c.IN_BAND:
             trust = {"agent": c.AGENT, "ingested": c.INGESTED, "none": c.OPERATOR}[
                 self.policy.clamp
             ]
+            relabeled = trust != c.OPERATOR
         rid = self.next_id
         self.next_id += 1
         self.rows[rid] = _Row(trust, self.policy.born_actionable, durable)
         if durable:
             self.receipts.add(rid)
+        if relabeled:
+            self.clamped.add(rid)
         return rid
+
+    def clamp_recorded(self, record_id: int) -> bool:
+        return record_id in self.clamped
 
     def read(self, record_id: int) -> StoredRecord | None:
         row = self.rows.get(record_id)
@@ -159,10 +169,18 @@ class PolicyStore:
     def count_records(self) -> int:
         return len(self.rows)
 
-    def health_ok(self) -> bool:
+    def durable_violations(self) -> int:
         if self.policy.health == "always_ok":
-            return True
-        return all(r in self.rows and self.rows[r].durable for r in self.receipts)
+            return 0
+        return sum(
+            1 for r in self.receipts if r not in self.rows or not self.rows[r].durable
+        )
+
+    def health_ok(self) -> bool:
+        return self.durable_violations() == 0
+
+    def force_durable_loss(self, record_id: int) -> None:
+        self.force_lose(record_id)
 
     # --- oracle-only access: not part of the adapter contract ---
 
@@ -196,15 +214,18 @@ def _snap(a: PolicyStore) -> dict[int, tuple[str, bool, bool]]:
 
 
 def spec_vl1(a: PolicyStore) -> bool:
-    """SPEC VL-1: in-band operator reads back as agent; agent/ingested unchanged."""
-    for trust in TRUSTS:
+    """SPEC VL-1: no label means agent; in-band operator reads back as agent with
+    a recorded clamp; agent and ingested are stored unchanged and unclamped."""
+    for trust in (None, *TRUSTS):
         for channel in CHANNELS:
             a.fresh()
-            r = a.read(a.write("x", source_trust=trust, channel=channel, durable=False))
-            expected = (
-                c.AGENT if (trust == c.OPERATOR and channel == c.IN_BAND) else trust
-            )
+            rid = a.write("x", source_trust=trust, channel=channel, durable=False)
+            r = a.read(rid)
+            clamp = trust == c.OPERATOR and channel == c.IN_BAND
+            expected = c.AGENT if (trust is None or clamp) else trust
             if r is None or r.source_trust != expected:
+                return False
+            if a.clamp_recorded(rid) is not clamp:
                 return False
     return True
 
@@ -282,7 +303,7 @@ def spec_vl4(a: PolicyStore) -> bool:
     if survivors != set(durable) | set(plain[-CAP:]) or not a.health_ok():
         return False
     a.force_lose(durable[0])
-    return a.health_ok() is False
+    return a.health_ok() is False and a.durable_violations() > 0
 
 
 SPEC: dict[str, Callable[[PolicyStore], bool]] = {
@@ -407,19 +428,37 @@ def test_block_everything_fails_the_positive_probes_of_vl2() -> None:
     assert report.score < 1.0
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "SPEC.md 'A block-everything store fails the positive probes of VL-1 and "
-        "VL-2': counterexample: a store with an honest clamp whose activate() and "
-        "promote() always refuse (the repo's own _BlockEverythingAdapter) passes "
-        "VL-1 positive 2/2. VL-1's positives never touch the operator fast path, "
-        "so only VL-2 fails (score 0.75)."
-    ),
-)
-def test_block_everything_fails_the_positive_probes_of_vl1() -> None:
-    by = {s.invariant: s for s in score_adapter(PolicyStore(BLOCK_ALL)).invariants}
-    assert by["VL-1"].positive_rate < 1.0
+def test_block_everything_passes_vl1_as_corrected_spec_says() -> None:
+    # SPEC.md used to say block-everything also fails VL-1's positives. It does
+    # not: blocking the gate leaves label storage intact, so only VL-2 fails
+    # (the repo's own _BlockEverythingAdapter test agrees). The spec sentence
+    # was corrected; this pins the corrected claim.
+    report = score_adapter(PolicyStore(BLOCK_ALL))
+    failed = {s.invariant for s in report.invariants if not s.passed}
+    assert failed == {"VL-2"}
+    assert report.score == 0.75
+
+
+class _StoresEverythingAsIngested(PolicyStore):
+    """A store that also blocks honest labels: every write is kept as ingested."""
+
+    def write(
+        self, payload: str, *, source_trust: str | None, channel: str, durable: bool
+    ) -> int:
+        rid = super().write(
+            payload, source_trust=c.INGESTED, channel=channel, durable=durable
+        )
+        return rid
+
+
+def test_a_store_that_blocks_labels_fails_vl1_positives() -> None:
+    # The other half of the corrected sentence: refusing to keep labels is what
+    # costs VL-1's positive probes.
+    by = {
+        s.invariant: s
+        for s in score_adapter(_StoresEverythingAsIngested(BLOCK_ALL)).invariants
+    }
+    assert by["VL-1"].positive_rate < 1.0 and not by["VL-1"].passed
 
 
 @given(policy=policies)
@@ -463,32 +502,89 @@ def _sound(policy: Policy, inv: str) -> None:
         assert SPEC[inv](PolicyStore(policy)), f"{inv} PASS on a store that violates it"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "VL-1 soundness: Policy(clamp='ingested') stores an in-band operator "
-        "request as 'ingested' (no clamp to agent, nothing recorded) and passes "
-        "VL-1 3/3; the adversarial probe only checks source_trust != operator, "
-        "and no probe covers the default label or the recorded clamp."
-    ),
+# The four stores below scored a perfect 1.00 against the first version of the
+# probes while each violated one invariant (Hypothesis shrank each to a single
+# changed mechanism). They are pinned twice: as @example cases of the soundness
+# properties, and as direct tests that each now fails exactly its invariant.
+
+LAUNDERING_STORES: dict[str, list[Policy]] = {
+    "VL-1": [replace(HONEST, clamp="ingested")],
+    "VL-2": [
+        replace(HONEST, promote_in_band="make_actionable"),
+        replace(HONEST, promote_oob="all_records"),
+    ],
+    "VL-3": [replace(HONEST, envelope="agent_as_operator")],
+    "VL-4": [replace(HONEST, health="always_ok")],
+}
+
+
+@pytest.mark.parametrize(
+    ("invariant", "policy"),
+    [(inv, p) for inv, ps in LAUNDERING_STORES.items() for p in ps],
 )
+def test_former_perfect_scorer_now_fails_exactly_its_invariant(
+    invariant: str, policy: Policy
+) -> None:
+    report = score_adapter(PolicyStore(policy))
+    failed = {s.invariant for s in report.invariants if not s.passed}
+    assert failed == {invariant}
+    assert report.score == 0.75
+    assert not SPEC[invariant](PolicyStore(policy))
+
+
+class _SilentClamp(PolicyStore):
+    """Clamps in-band operator to agent but records nothing."""
+
+    def clamp_recorded(self, record_id: int) -> bool:
+        return False
+
+
+class _DefaultIngested(PolicyStore):
+    """Honest clamp, but an unlabeled write is stored as ingested."""
+
+    def write(
+        self, payload: str, *, source_trust: str | None, channel: str, durable: bool
+    ) -> int:
+        label = c.INGESTED if source_trust is None else source_trust
+        return super().write(
+            payload, source_trust=label, channel=channel, durable=durable
+        )
+
+
+class _UncountedLoss(PolicyStore):
+    """Health turns false on a loss but reports a zero counter."""
+
+    def durable_violations(self) -> int:
+        return 0
+
+    def health_ok(self) -> bool:
+        return all(r in self.rows and self.rows[r].durable for r in self.receipts)
+
+
+@pytest.mark.parametrize(
+    ("invariant", "store"),
+    [
+        ("VL-1", _SilentClamp(HONEST)),
+        ("VL-1", _DefaultIngested(HONEST)),
+        ("VL-4", _UncountedLoss(HONEST)),
+    ],
+    ids=["silent-clamp", "default-not-agent", "loss-without-counter"],
+)
+def test_other_pass_condition_breaks_fail_exactly_their_invariant(
+    invariant: str, store: PolicyStore
+) -> None:
+    # Parts of the pass conditions the 3888-store family does not vary.
+    failed = {s.invariant for s in score_adapter(store).invariants if not s.passed}
+    assert failed == {invariant}
+    assert not SPEC[invariant](store)
+
+
 @given(policy=policies)
 @example(policy=replace(HONEST, clamp="ingested"))
 def test_suite_is_sound_for_vl1(policy: Policy) -> None:
     _sound(policy, "VL-1")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "VL-2 soundness: Policy(promote_in_band='make_actionable') makes an agent "
-        "record actionable on an in-band promote() while leaving its label at "
-        "agent, and scores VL-2 PASS 6/6: the in-band promotion probe checks only "
-        "source_trust, never actionable or 'mutates nothing'. Also: "
-        "Policy(promote_oob='all_records') promotes every record, not one exact "
-        "record, and passes."
-    ),
-)
 @given(policy=policies)
 @example(policy=replace(HONEST, promote_in_band="make_actionable"))
 @example(policy=replace(HONEST, promote_oob="all_records"))
@@ -496,29 +592,12 @@ def test_suite_is_sound_for_vl2(policy: Policy) -> None:
     _sound(policy, "VL-2")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "VL-3 soundness: Policy(envelope='agent_as_operator') labels every agent "
-        "record's envelope source_trust 'operator' and passes VL-3 2/2: the "
-        "positive probe checks only envelope.kind on an agent record and the "
-        "adversarial probe checks the label only on an ingested record."
-    ),
-)
 @given(policy=policies)
 @example(policy=replace(HONEST, envelope="agent_as_operator"))
 def test_suite_is_sound_for_vl3(policy: Policy) -> None:
     _sound(policy, "VL-3")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "VL-4 soundness: Policy(health='always_ok') never reports a lost durable "
-        "record and passes VL-4 2/2: no probe forces a durable loss or orphan, so "
-        "SPEC's 'reported by health with a non-zero counter' is never exercised."
-    ),
-)
 @given(policy=policies)
 @example(policy=replace(HONEST, health="always_ok"))
 def test_suite_is_sound_for_vl4(policy: Policy) -> None:

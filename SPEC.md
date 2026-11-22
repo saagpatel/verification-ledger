@@ -157,7 +157,7 @@ the same way, rather than assuming the reference's:
   prunes to the store's own cap, and a store that auto-prunes on write may make it
   a no-op.
 
-Three more methods let the probes check the parts of each pass condition that a
+Four more hooks let the probes check the parts of each pass condition that a
 read alone cannot show, again in the store's own terms:
 
 - **`write(..., source_trust=None)`**: no label at all, so the VL-1 probe can
