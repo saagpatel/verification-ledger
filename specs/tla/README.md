@@ -128,9 +128,9 @@ the two statements of `activate()` and `prune()` are all explored.
 
 ## Results
 
-TLC 2.x, 6 workers, breadth-first, on the bounds above. "Generated" and
-"distinct" are TLC's state counts and "depth" is the search depth TLC reports
-(multi-worker BFS depth can vary by one between runs). For a violation,
+TLC 2.x, 5 workers, breadth-first, on the bounds above (round 3 run). "Generated"
+and "distinct" are TLC's state counts and "depth" is the search depth TLC
+reports (multi-worker BFS depth can vary by one between runs). For a violation,
 "trace" is the number of states in TLC's counterexample.
 
 | Config | Result | Generated | Distinct | Depth | Trace |
@@ -139,14 +139,16 @@ TLC 2.x, 6 workers, breadth-first, on the bounds above. "Generated" and
 | `Control_GateDecisionOnly` | no violation | 915,554,994 | 66,738,595 | 24 | |
 | `Control_PruneSelectionOnly` | no violation | 804,736,992 | 61,286,731 | 25 | |
 | `Finding_ReceiptErased` | no violation | 2,866,764,108 | 200,875,919 | 27 | |
-| `Control_GateSkipsCheck` | `VL2_ActionableIsOperator` violated | 1,089 | 258 | 6 | 6 |
+| `Check_MetaErased` | no violation | 93,988,058 | 6,140,509 | 22 | |
+| `Control_GateSkipsCheck` | `VL2_ActionableIsOperator` violated | 603 | 157 | 6 | 6 |
 | `Control_NoClamp` | `VL1_Clamp` violated | 2 | 2 | 2 | 2 |
-| `Control_PromotionIgnoresChannel` | `VL1_OperatorOnlyOutOfBand` violated | 185 | 56 | 5 | 5 |
-| `Control_PruneIgnoresDurable` | `VL4_DurableKept` violated | 5,975 | 1,282 | 6 | 6 |
-| `Control_HealthIgnoresDigest` | `VL4_LossDetected` violated | 1,051 | 247 | 6 | 5 |
-| `Control_HealthIgnoresChainMeta` | `VL4_LossDetected` violated | 1,053 | 242 | 5 | 5 |
-| `Control_ConsistentChainRewrite` | `VL4_LossDetected` violated (out of scope, documented) | 934 | 198 | 5 | 3 |
-| `Witness_FastPath` | `NoRecordEverActionable` violated (expected) | 13,506 | 2,894 | 7 | 7 |
+| `Control_PromotionIgnoresChannel` | `VL1_OperatorOnlyOutOfBand` violated | 147 | 54 | 5 | 5 |
+| `Control_PruneIgnoresDurable` | `VL4_DurableKept` violated | 8,041 | 1,757 | 6 | 4 |
+| `Control_HealthIgnoresDigest` | `VL4_LossDetected` violated | 1,053 | 237 | 5 | 5 |
+| `Control_HealthIgnoresChainMeta` | `VL4_LossDetected` violated | 1,101 | 247 | 5 | 3 |
+| `Control_ConsistentChainRewrite` | `VL4_LossDetected` violated (out of scope, documented) | 960 | 197 | 5 | 3 |
+| `Control_WriteRecreatesMeta` | `VL4_LossDetected` violated | 50,617 | 8,170 | 7 | 5 |
+| `Witness_FastPath` | `NoRecordEverActionable` violated (expected) | 11,560 | 2,500 | 7 | 7 |
 
 Traces, read from the logs:
 
@@ -154,9 +156,13 @@ Traces, read from the logs:
   an agent record; the UPDATE sets `actionable` on it.
 - `Control_HealthIgnoresDigest`: three writes; the adversary overwrites a
   durable payload; with the digest check off, health stays ok.
-- `Control_HealthIgnoresChainMeta`: three writes; the adversary erases the
-  newest durable receipt (with its row); every remaining link is valid, so only
-  the length and head check would have caught it.
+- `Control_HealthIgnoresChainMeta`: one durable write; the adversary erases
+  its receipt (the newest one); every remaining link is valid, so only the
+  length and head check would have caught it.
 - `Control_ConsistentChainRewrite`: one durable write; the adversary overwrites
   it and recomputes its digest, every link and the metadata; health stays ok.
   This is the case SPEC.md puts out of scope.
+- `Control_WriteRecreatesMeta`: one durable write; the adversary erases it with
+  its receipt and deletes the metadata; a new durable write recreates the
+  metadata from scratch and the chain verifies, so the loss goes unseen. The
+  fixed `write()` leaves missing metadata missing.
