@@ -28,10 +28,8 @@ any configuration's result differs from its expectation.
 
 ## Bounds
 
-Every configuration uses the same bounds, **3 record slots, 3 in-band agents
-(symmetric), keep in {0, 1}**, plus the operator and the store-level adversary,
-except `Check_MetaErased`, which uses 2 agents: adding metadata deletion on top
-of receipt erasure multiplies the state space about fourfold.
+Every configuration uses the same bounds: **3 record slots, 3 in-band agents
+(symmetric), keep in {0, 1}**, plus the operator and the store-level adversary.
 Each agent may hold one pending second statement (activation's guarded UPDATE
 or prune's DELETE) while every other actor moves, so the interleavings between
 the two statements of `activate()` and `prune()` are all explored.
@@ -51,7 +49,7 @@ the two statements of `activate()` and `prune()` are all explored.
 | `Control_HealthIgnoresDigest` | health skips the digest comparison; adversary may overwrite | `VL4_LossDetected` violated (an overwrite goes unseen) |
 | `Control_HealthIgnoresChainMeta` | health skips the length and head check; adversary may erase receipts | `VL4_LossDetected` violated (erasing the newest receipt leaves every link valid) |
 | `Control_ConsistentChainRewrite` | adversary overwrites or erases, then recomputes every digest, link and the metadata | `VL4_LossDetected` violated: the documented out-of-scope case, undetectable without an anchor outside the store |
-| `Check_MetaErased` | adversary may also delete the chain metadata; writes never recreate it (2 agents) | no violation |
+| `Check_MetaErased` | adversary may erase receipts and delete the chain metadata (row deletion, demotion and overwrite are left to `VerificationLedger`, to keep the state space tractable); writes never recreate metadata | no violation |
 | `Control_WriteRecreatesMeta` | as `Check_MetaErased`, but a durable write recreates missing metadata (the round 2 review bug) | `VL4_LossDetected` violated: erase the only durable record and its receipt, delete the metadata, write a new durable record, and the chain verifies |
 | `Witness_FastPath` | all real mechanisms; checks `NoRecordEverActionable` | violated, which exhibits an operator record becoming actionable |
 
