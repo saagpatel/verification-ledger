@@ -70,6 +70,16 @@ _RECEIPT_COLUMNS = ("digest", "prev_hash", "receipt_hash")
 
 
 @dataclass(frozen=True)
+class _SchemaState:
+    """The ledger's tables, receipt integrity columns and schema version as found
+    when a store is opened, before any schema statement runs."""
+
+    tables: frozenset[str]
+    integrity_columns: frozenset[str]
+    version: str | None
+
+
+@dataclass(frozen=True)
 class WriteResult:
     """Outcome of a write. ``clamped`` records a refused in-band operator mint."""
 
@@ -165,14 +175,16 @@ class Ledger:
         # Schema creation and migration run under the write lock, so two
         # processes opening the same legacy store cannot both migrate it.
         with self._txn("IMMEDIATE"):
-            existed = self._has_table("records")
+            state = self._schema_state()
             for statement in _SCHEMA.split(";"):
                 if statement.strip():
                     self._conn.execute(statement)
-            self._migrate(existed)
+            self._migrate(state)
 
     @contextmanager
-    def _txn(self, mode: Literal["DEFERRED", "IMMEDIATE"]) -> Generator[None, None, None]:
+    def _txn(
+        self, mode: Literal["DEFERRED", "IMMEDIATE"]
+    ) -> Generator[None, None, None]:
         """One SQLite transaction around a multi-statement operation.
 
         ``DEFERRED`` gives a consistent read snapshot (WAL mode); ``IMMEDIATE``
@@ -190,41 +202,74 @@ class Ledger:
             raise
         self._conn.commit()
 
-    def _has_table(self, name: str) -> bool:
-        row = self._conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
-        ).fetchone()
-        return row is not None
-
-    def _migrate(self, existed: bool) -> None:
-        """Start the receipt chain on a new store, or migrate a pre-chain store.
-
-        Runs exactly once per store, on a real schema transition:
-
-        - a new store gets empty chain metadata and the schema version;
-        - a store written before the chain existed (its ``durable_receipts``
-          table has no integrity columns) gets the columns, a digest and link
-          for every receipt, the chain metadata and the schema version.
-
-        A store already on the chain schema is never touched here. Missing or
-        NULL integrity fields, or missing metadata, are evidence of tampering
-        and stay for health to report; reopening must not repair them.
-        """
-        if not existed:
-            self._set_meta(0, GENESIS)
-            self._set_version()
-            return
+    def _schema_state(self) -> _SchemaState:
+        """What the store looked like before this open touched it."""
+        tables = {
+            str(r["name"])
+            for r in self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
         cols = {
             str(r["name"])
             for r in self._conn.execute("PRAGMA table_info(durable_receipts)")
         }
-        if all(col in cols for col in _RECEIPT_COLUMNS):
-            return  # already on the chain schema
+        version = None
+        if "ledger_meta" in tables:
+            row = self._conn.execute(
+                "SELECT value FROM ledger_meta WHERE key = 'schema_version'"
+            ).fetchone()
+            version = None if row is None else str(row["value"])
+        return _SchemaState(
+            tables=frozenset(tables & {"records", "durable_receipts", "ledger_meta"}),
+            integrity_columns=frozenset(cols & set(_RECEIPT_COLUMNS)),
+            version=version,
+        )
+
+    def _migrate(self, state: _SchemaState) -> None:
+        """Start the receipt chain on a new store, or migrate a pre-chain store.
+
+        Exactly three cases, decided from the store as it was before this open:
+
+        - **new**: none of the ledger's tables existed. It gets empty chain
+          metadata and the schema version.
+        - **pre-chain**: ``durable_receipts`` existed with *none* of the
+          integrity columns and there is no ``schema_version``. It gets the
+          columns, a digest and link for every receipt, the chain metadata and
+          the schema version, once.
+        - **anything else** is a chain-schema store, intact or damaged. Nothing
+          is regenerated: a missing table is created empty and a missing
+          integrity column is added empty (NULL) so the store stays usable, and
+          no existing value, receipt link, metadata row or schema version is
+          written. The damage stays for health to report as chain breaks
+          (NULL fields, missing metadata, missing version, missing receipts).
+        """
+        if not state.tables:
+            self._set_meta(0, GENESIS)
+            self._set_version()
+            return
+        pre_chain = (
+            "durable_receipts" in state.tables
+            and not state.integrity_columns
+            and state.version is None
+        )
+        present = {
+            str(r["name"])
+            for r in self._conn.execute("PRAGMA table_info(durable_receipts)")
+        }
         for col in _RECEIPT_COLUMNS:
-            if col not in cols:
+            if col not in present:
                 self._conn.execute(
                     f"ALTER TABLE durable_receipts ADD COLUMN {col} TEXT"
                 )
+        if not pre_chain:
+            if state.integrity_columns != frozenset(_RECEIPT_COLUMNS):
+                logger.error(
+                    "durable_receipts is missing integrity columns %s on a "
+                    "chain-schema store; added empty, reported by health",
+                    sorted(set(_RECEIPT_COLUMNS) - state.integrity_columns),
+                )
+            return
         receipts = self._receipts()
         chained = relink(receipts, self._live_records())
         for r in chained:
@@ -237,6 +282,33 @@ class Ledger:
         self._set_meta(len(chained), head or GENESIS)
         self._set_version()
         logger.info("migrated %d durable receipts to the hash chain", len(chained))
+
+    def _never_reuse_receipted_ids(self) -> None:
+        """Keep the id sequence past every receipted id.
+
+        AUTOINCREMENT never reuses an id unless its sequence row is reset or the
+        records table is dropped and recreated. Either would hand a new record
+        the id of a durable record whose receipt is still on the chain; the
+        sequence is bumped instead, so a write never collides with (or appears
+        to stand in for) existing evidence. The sequence is id allocation, not
+        evidence, so this repairs nothing health checks.
+        """
+        top = self._conn.execute(
+            "SELECT COALESCE(MAX(record_id), 0) FROM durable_receipts"
+        ).fetchone()[0]
+        row = self._conn.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'records'"
+        ).fetchone()
+        if row is None:
+            if top:
+                self._conn.execute(
+                    "INSERT INTO sqlite_sequence (name, seq) VALUES ('records', ?)",
+                    (top,),
+                )
+        elif int(row[0]) < top:
+            self._conn.execute(
+                "UPDATE sqlite_sequence SET seq = ? WHERE name = 'records'", (top,)
+            )
 
     def _receipts(self) -> list[Receipt]:
         rows = self._conn.execute(
@@ -319,14 +391,13 @@ class Ledger:
         created_at = _utc_now()
         with self._txn("IMMEDIATE"):
             rowid = self._insert(payload, source_trust, durable, created_at)
-        return WriteResult(
-            record_id=rowid, source_trust=source_trust, clamped=clamped
-        )
+        return WriteResult(record_id=rowid, source_trust=source_trust, clamped=clamped)
 
     def _insert(
         self, payload: str, source_trust: Trust, durable: bool, created_at: str
     ) -> int:
         """The row and, for a durable record, its receipt; inside one transaction."""
+        self._never_reuse_receipted_ids()
         cursor = self._conn.execute(
             "INSERT INTO records (payload, source_trust, durable, actionable, created_at) "
             "VALUES (?, ?, ?, 0, ?)",

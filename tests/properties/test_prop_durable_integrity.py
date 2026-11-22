@@ -550,3 +550,182 @@ def test_rebuilding_the_pre_chain_schema_is_the_documented_limit() -> None:
             conn.execute("DROP TABLE ledger_meta")
             conn.commit()
         assert _reopen_health(db).ok is True
+
+
+# --- round 3 review: only a genuine pre-chain schema is ever migrated ---
+#
+# Decided rule: migrate only when durable_receipts has none of the integrity
+# columns AND ledger_meta has no schema_version. Every other mismatch is
+# damage: health reports it, and startup never regenerates evidence (a missing
+# column or table may be re-created empty so the store stays usable, but no
+# digest, link, metadata row or version is written).
+
+_INTEGRITY_COLUMNS = ("digest", "prev_hash", "receipt_hash")
+
+
+def _meta_rows(db: str) -> list[tuple[object, ...]]:
+    raw = sqlite3.connect(db)
+    try:
+        has = raw.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ledger_meta'"
+        ).fetchone()
+        if has is None:
+            return []
+        return [tuple(r) for r in raw.execute("SELECT * FROM ledger_meta ORDER BY key")]
+    finally:
+        raw.close()
+
+
+def _chain_store(db: str, forge: bool) -> int:
+    """Three durable records and one plain one; optionally forge the middle payload."""
+    with Ledger(db, policy=FailurePolicy.REPORT) as led:
+        ids = [led.write(f"d{i}", durable=True).record_id for i in range(3)]
+        led.write("plain")
+        if forge:
+            _conn(led).execute(
+                "UPDATE records SET payload = 'forged' WHERE id = ?", (ids[1],)
+            )
+            _conn(led).commit()
+        assert led.health().ok is (not forge)
+    return ids[1]
+
+
+def _damage(db: str, statements: list[str]) -> None:
+    raw = sqlite3.connect(db)
+    try:
+        for sql in statements:
+            raw.execute(sql)
+        raw.commit()
+    finally:
+        raw.close()
+
+
+def _assert_reported_and_never_repaired(db: str) -> None:
+    meta_before = _meta_rows(db)
+    first = _reopen_health(db)
+    assert first.ok is False and first.violation_count >= 1
+    # Startup on a damaged store writes no metadata at all.
+    assert _meta_rows(db) == meta_before
+    settled = _evidence(db)
+    for _ in range(2):
+        assert _reopen_health(db) == first
+        assert _evidence(db) == settled
+    # A later write does not repair it either.
+    with Ledger(db, policy=FailurePolicy.REPORT) as led:
+        led.write("later", durable=True)
+        led.write("later, plain")
+        assert led.health().ok is False
+    assert _reopen_health(db).ok is False
+
+
+_DAMAGE: dict[str, list[str]] = {
+    # The review's reproduction and its siblings: one integrity column dropped,
+    # the schema version kept.
+    **{
+        f"drop-{col}": [f"ALTER TABLE durable_receipts DROP COLUMN {col}"]
+        for col in _INTEGRITY_COLUMNS
+    },
+    "drop-two-columns": [
+        "ALTER TABLE durable_receipts DROP COLUMN digest",
+        "ALTER TABLE durable_receipts DROP COLUMN receipt_hash",
+    ],
+    "drop-all-columns-keep-version": [
+        f"ALTER TABLE durable_receipts DROP COLUMN {col}" for col in _INTEGRITY_COLUMNS
+    ],
+    "drop-version-only": ["DELETE FROM ledger_meta WHERE key = 'schema_version'"],
+    "drop-one-column-and-version": [
+        "ALTER TABLE durable_receipts DROP COLUMN digest",
+        "DELETE FROM ledger_meta WHERE key = 'schema_version'",
+    ],
+    "drop-meta-table": ["DROP TABLE ledger_meta"],
+    "drop-receipts-table": ["DROP TABLE durable_receipts"],
+    "drop-receipts-table-and-version": [
+        "DROP TABLE durable_receipts",
+        "DELETE FROM ledger_meta WHERE key = 'schema_version'",
+    ],
+    "drop-records-table": ["DROP TABLE records"],
+    "corrupt-version": [
+        "UPDATE ledger_meta SET value = '1' WHERE key = 'schema_version'"
+    ],
+}
+
+
+@pytest.mark.parametrize("forge", [True, False], ids=["forged", "unforged"])
+@pytest.mark.parametrize("damage", list(_DAMAGE), ids=list(_DAMAGE))
+def test_damaged_chain_schema_is_reported_and_never_regenerated(
+    damage: str, forge: bool
+) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        db = str(Path(tmp) / "fleet.db")
+        forged = _chain_store(db, forge)
+        _damage(db, _DAMAGE[damage])
+        _assert_reported_and_never_repaired(db)
+        if forge and damage not in {"drop-records-table"}:
+            h = _reopen_health(db)
+            # The forged payload is still caught (as an overwrite, or through
+            # a NULL digest that now fails to match the content).
+            if "receipts-table" not in damage:
+                assert h.digest_mismatches >= 1, forged
+
+
+def test_review_reproduction_drop_digest_keeps_forgery_visible() -> None:
+    # Verbatim from the round 3 review: one durable record, payload
+    # overwritten, only `digest` dropped, reopen. It used to migrate and report
+    # the forged payload as healthy.
+    with tempfile.TemporaryDirectory() as tmp:
+        db = str(Path(tmp) / "fleet.db")
+        with Ledger(db, policy=FailurePolicy.REPORT) as led:
+            rid = led.write("shipped artifact", durable=True).record_id
+            _conn(led).execute(
+                "UPDATE records SET payload = 'forged' WHERE id = ?", (rid,)
+            )
+            _conn(led).commit()
+        _damage(db, ["ALTER TABLE durable_receipts DROP COLUMN digest"])
+        h = _reopen_health(db)
+        assert h.ok is False
+        assert h.digest_mismatches == 1 and h.chain_breaks >= 1
+
+
+def test_reused_record_id_after_erasure_stays_reported() -> None:
+    # Reset the AUTOINCREMENT sequence after erasing a durable row and its
+    # receipt from the middle of the chain, so the next write reuses the id.
+    with tempfile.TemporaryDirectory() as tmp:
+        db = str(Path(tmp) / "fleet.db")
+        middle = _chain_store(db, forge=False)
+        _damage(
+            db,
+            [
+                f"DELETE FROM records WHERE id = {middle}",
+                f"DELETE FROM durable_receipts WHERE record_id = {middle}",
+                f"UPDATE sqlite_sequence SET seq = {middle - 1} WHERE name = 'records'",
+            ],
+        )
+        with Ledger(db, policy=FailurePolicy.REPORT) as led:
+            led.write("reuses the id", durable=True)
+            assert led.health().ok is False
+
+
+@pytest.mark.parametrize(
+    "statements",
+    [
+        # Every ledger table dropped: the store is indistinguishable from a new one.
+        ["DROP TABLE records", "DROP TABLE durable_receipts", "DROP TABLE ledger_meta"],
+        # All integrity columns and the version dropped: indistinguishable from a
+        # pre-chain store, so the next open migrates it.
+        [
+            f"ALTER TABLE durable_receipts DROP COLUMN {col}"
+            for col in _INTEGRITY_COLUMNS
+        ]
+        + ["DELETE FROM ledger_meta WHERE key = 'schema_version'"],
+    ],
+    ids=["wipe-every-table", "rebuild-pre-chain-schema"],
+)
+def test_schema_level_rewrites_are_the_documented_limit(statements: list[str]) -> None:
+    # Out of scope, like the consistent whole-chain rewrite: these make the
+    # store look new or pre-chain, and nothing inside it can tell the
+    # difference. Pinned so a change to this behavior is noticed.
+    with tempfile.TemporaryDirectory() as tmp:
+        db = str(Path(tmp) / "fleet.db")
+        _chain_store(db, forge=True)
+        _damage(db, statements)
+        assert _reopen_health(db).ok is True
