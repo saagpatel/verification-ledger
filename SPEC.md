@@ -190,30 +190,42 @@ the same way, rather than assuming the reference's:
   prunes to the store's own cap, and a store that auto-prunes on write may make it
   a no-op.
 
-Four more hooks let the probes check the parts of each pass condition that a
-read alone cannot show, again in the store's own terms:
+More hooks let the probes check the parts of each pass condition that a single
+read cannot show, again in the store's own terms:
 
 - **`write(..., source_trust=None)`**: no label at all, so the VL-1 probe can
   check the write default.
 - **`clamp_recorded(record_id)`**: whether the store recorded a VL-1 clamp for
   that write (the reference keeps it on the write result; another store may keep
   a column or an audit row).
+- **`record_ids()`**: every record the store holds, so a probe can read back the
+  store's complete state, not only the records it wrote.
 - **`durable_violations()`** and **`force_durable_loss(record_id)`**: the store's
   VL-4 violation counter, and a test hook that destroys a durable record behind
   the API the way housekeeping SQL or a crash would. The VL-4 adversarial probe
   forces a loss and requires health to report it with a non-zero counter.
 
-Each probe starts from `fresh()` and writes every record it later inspects, so
-it knows the store's complete record set. Wherever SPEC says an operation
-"mutates nothing" or touches "one exact record", the probe compares
-`count_records()` as well as every known record, so a store that refuses an
-operation but creates an operator record on the side does not pass. A read
-(`StoredRecord`) exposes each record's label, actionability, envelope, payload
-and durability, and the probes compare all of them, the operation's own target
-included: an activation may change only the target's actionability (it must
-stay operator trust with its content intact), an out-of-band promotion only its
-label, and a prune must leave every surviving durable record durable and
-unchanged.
+A read (`StoredRecord`) exposes each record's label, actionability, envelope,
+payload and durability. Every probe follows one rule. Before and after each
+mutating operation it takes a full-state snapshot: every listed record, read
+back through `read()` as a consumer would get it, plus the record count. It
+then checks the change against one allowed-delta table. Anything the table does
+not allow must be identical, on every record:
+
+| Operation | Allowed change | Owner of a violation |
+|---|---|---|
+| write | one new record: its label by the VL-1 clamp rule, its payload and durability as written, not actionable | label, payload, extra records: VL-1; actionability: VL-2; durability, dropped records: VL-4 |
+| seed_operator | one new record: operator, not actionable, not durable, payload as given | VL-2 |
+| activate (operator target) | the target's actionability becomes true | VL-2 |
+| activate (any other target) | nothing; the call reports refused | VL-2 |
+| promote in-band | nothing | VL-2 |
+| promote out-of-band | the target's label becomes operator | VL-2 |
+| prune | only non-durable records are removed, down to exactly the store's cap | VL-4 |
+
+After every operation, every record's envelope must carry the boundary kind,
+a warning and the record's current label, and an envelope may change only
+when its record's label does (VL-3). The table is `ALLOWED_DELTAS` and
+`OWNERS` in `verification_ledger.conformance.probes`.
 
 The suite runs entirely against this protocol, so it grades the bundled reference
 implementation and any third-party store the same way. The suite is the standard;
