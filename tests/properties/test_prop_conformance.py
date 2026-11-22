@@ -91,6 +91,9 @@ class PolicyStore:
     receipts: set[int] = field(default_factory=lambda: set())
     clamped: set[int] = field(default_factory=lambda: set())
     next_id: int = 1
+    # How ids are handed out. The contract does not require ids to follow
+    # creation order; retention here follows creation (insertion) order.
+    ids: str = "increasing"  # "increasing" | "decreasing" | "shuffled"
 
     def fresh(self) -> None:
         self.rows = {}
@@ -121,13 +124,18 @@ class PolicyStore:
         return rid
 
     def _keep_to_cap(self) -> None:
-        plain = sorted(i for i, r in self.rows.items() if not r.durable)
+        plain = [i for i, r in self.rows.items() if not r.durable]  # oldest first
         for i in plain[: max(0, len(plain) - CAP)]:
             del self.rows[i]
 
     def _insert(self, trust: str, durable: bool, payload: str = "side") -> int:
-        rid = self.next_id
+        n = self.next_id
         self.next_id += 1
+        rid = {
+            "increasing": n,
+            "decreasing": 1_000_000 - n,
+            "shuffled": (n * 7919) % 1_000_003,
+        }[self.ids]
         self.rows[rid] = _Row(trust, self.policy.born_actionable, durable, payload)
         if durable:
             self.receipts.add(rid)
@@ -203,7 +211,7 @@ class PolicyStore:
     def prune(self) -> None:
         if self.policy.prune == "noop":
             return
-        newest_first = sorted(self.rows, reverse=True)
+        newest_first = list(reversed(self.rows))  # by creation, not by id
         if self.policy.prune == "correct":
             newest_first = [i for i in newest_first if not self.rows[i].durable]
         for i in newest_first[CAP:]:
@@ -345,6 +353,7 @@ class _Oracle:
         a.fresh()
         self.state: dict[int, StoredRecord] = {}
         self.broken: set[str] = set()
+        self.created: list[int] = []  # creation order as observed; ids carry none
 
     def _judge(
         self,
@@ -373,7 +382,11 @@ class _Oracle:
             # A write or seed may keep the store at its cap on its own: it may
             # drop the oldest non-durable records, never a durable one, and
             # never so many that fewer than the cap remain.
-            existing = sorted(i for i in self.state if predicted[i]["durable"] is False)
+            existing = [
+                i
+                for i in self.created
+                if i in self.state and predicted[i]["durable"] is False
+            ]
             oldest_first = set(existing[: len(gone)])
             remaining = [i for i in seen if seen[i].durable is False]
             if gone != oldest_first or len(remaining) < keeps_cap:
@@ -400,7 +413,21 @@ class _Oracle:
                 self.broken.add("VL-3")
         if not all(_true_envelope(r) for r in seen.values()):
             self.broken.add("VL-3")
+        fresh_ids = [i for i in seen if i not in self.state and i not in self.created]
+        self.created += [i for i in fresh_ids if i in predicted]
+        self.created += [i for i in fresh_ids if i not in predicted]
         self.state = seen
+
+    def _new_id(self, op: str, rid: object) -> int | None:
+        """The id a write or seed returned, if it is the one record it created."""
+        seen = _observe(self.a) or {}
+        made = set(seen) - set(self.state)
+        if isinstance(rid, int) and not isinstance(rid, bool) and rid in made:
+            return rid
+        self.broken.add(_ORACLE_OWNER[op]["extra"])
+        # Carry on with the record it did create, so one wrong return value
+        # is not also counted as a later loss.
+        return next(iter(made)) if len(made) == 1 else None
 
     def _now(self) -> dict[int, dict[str, object]]:
         return {
@@ -419,68 +446,79 @@ class _Oracle:
         trust: str | None,
         durable: bool = False,
         channel: str = c.IN_BAND,
-    ) -> int:
-        rid = self.a.write(
+    ) -> int | None:
+        returned: object = self.a.write(
             payload, source_trust=trust, channel=channel, durable=durable
         )
+        rid = self._new_id("write", returned)
         clamped = trust == c.OPERATOR and channel == c.IN_BAND
         label = c.AGENT if trust is None or clamped else trust
         predicted = self._now()
-        predicted[rid] = {
-            "trust": label,
-            "actionable": False,
-            "payload": payload,
-            "durable": durable,
-        }
+        if rid is not None:
+            predicted[rid] = {
+                "trust": label,
+                "actionable": False,
+                "payload": payload,
+                "durable": durable,
+            }
         self._judge("write", predicted, keeps_cap=self.a.prune_cap())
-        if self.a.clamp_recorded(rid) is not clamped:
+        if rid is not None and self.a.clamp_recorded(rid) is not clamped:
             self.broken.add("VL-1")
         return rid
 
-    def seed(self, payload: str) -> int:
-        rid = self.a.seed_operator(payload)
+    def seed(self, payload: str) -> int | None:
+        returned: object = self.a.seed_operator(payload)
+        rid = self._new_id("seed", returned)
         predicted = self._now()
-        predicted[rid] = {
-            "trust": c.OPERATOR,
-            "actionable": False,
-            "payload": payload,
-            "durable": False,
-        }
+        if rid is not None:
+            predicted[rid] = {
+                "trust": c.OPERATOR,
+                "actionable": False,
+                "payload": payload,
+                "durable": False,
+            }
         self._judge("seed", predicted, keeps_cap=self.a.prune_cap())
         return rid
 
-    def activate(self, rid: int) -> None:
-        if rid not in self.state:
-            return  # already reported as lost
+    def activate(self, rid: int | None) -> None:
+        if rid is None or rid not in self.state:
+            return  # already reported
         operator = self.state[rid].source_trust == c.OPERATOR
         result = self.a.activate(rid, channel=c.IN_BAND)
         predicted = self._now()
         if operator:
             predicted[rid] = {**predicted[rid], "actionable": True}
-        if result is not operator:
+        if result is not operator:  # "whether the record is now actionable"
             self.broken.add("VL-2")
         self._judge("activate" if operator else "refuse", predicted)
 
-    def promote(self, rid: int, channel: str) -> None:
-        if rid not in self.state:
-            return  # already reported as lost
-        self.a.promote(rid, channel=channel)
+    def promote(self, rid: int | None, channel: str) -> None:
+        if rid is None or rid not in self.state:
+            return  # already reported
+        was_operator = self.state[rid].source_trust == c.OPERATOR
+        result = self.a.promote(rid, channel=channel)
         predicted = self._now()
         if channel == c.OUT_OF_BAND:
             predicted[rid] = {**predicted[rid], "trust": c.OPERATOR}
             self._judge("promote", predicted)
+            should_be = True
         else:
             self._judge("promote_in_band", predicted)
+            should_be = was_operator
+        if result is not should_be:  # "whether the record is now operator"
+            self.broken.add("VL-2")
 
     def prune(self) -> None:
-        self.a.prune()
+        result: object = self.a.prune()
         self._judge("prune", self._now(), prune_cap=self.a.prune_cap())
+        if result is not None:
+            self.broken.add("VL-4")
 
 
 def _oracle_run(a: LedgerAdapter, scenario: Scenario) -> set[str]:
     """The oracle's own interpretation of one shared scenario."""
     o = _Oracle(a)
-    named: dict[str, int] = {}
+    named: dict[str, int | None] = {}
     for step in scenario.steps(a.prune_cap()):
         if step.op == "write":
             named[step.name] = o.write(
@@ -498,8 +536,9 @@ def _oracle_run(a: LedgerAdapter, scenario: Scenario) -> set[str]:
             if a.health_ok() is not True or a.durable_violations() != 0:
                 o.broken.add("VL-4")
         elif step.op == "force_loss":
-            if named[step.name] in o.state:
-                a.force_durable_loss(named[step.name])
+            lost = named.get(step.name)
+            if lost is not None and lost in o.state:
+                a.force_durable_loss(lost)
         elif step.op == "expect_loss_reported":
             if a.health_ok() is not False or a.durable_violations() <= 0:
                 o.broken.add("VL-4")
@@ -1063,6 +1102,12 @@ class Mutation:
         )
         if self.scope == "cap":
             key = "lost"
+        if self.scope == "result":
+            key = {"write": "extra", "seed_operator": "extra", "prune": "lost"}.get(
+                self.op, "actionable"
+            )
+        if self.field in ("refused", "allowed", "mint"):
+            key = "actionable"
         return _ORACLE_OWNER[_ORACLE_OP[self.op]][key]
 
     def __str__(self) -> str:
@@ -1100,28 +1145,47 @@ MUTATIONS: list[Mutation] = [
         for op in ("write", "seed_operator")
         for how in ("durable", "over")
     ),
+    # Round 5 review, one systematic pass over the scenarios' input space:
+    # every return value the contract defines, flipped or wrong.
+    *(Mutation(op, "result", "flipped") for op in MUTATED_OPS),
+    # Every kind of record through every gate operation.
+    *(Mutation("write", kind, "trust") for kind in WRITE_KINDS),
+    *(Mutation("activate_refused", kind, "allowed") for kind in WRITE_KINDS),
+    *(Mutation("promote_in_band", kind, "mint") for kind in WRITE_KINDS),
+    *(Mutation("promote_out_of_band", kind, "refused") for kind in WRITE_KINDS),
+    *(
+        Mutation("activate_operator", f"promoted-{kind}", "refused")
+        for kind in WRITE_KINDS
+    ),
 ]
 
 
 class MutantStore:
     """An honest PolicyStore whose one operation also applies one forbidden change."""
 
-    def __init__(self, mutation: Mutation, policy: Policy = HONEST) -> None:
+    def __init__(
+        self, mutation: Mutation, policy: Policy = HONEST, ids: str = "increasing"
+    ) -> None:
         self.m = mutation
-        self.inner = PolicyStore(policy)
+        self.inner = PolicyStore(policy, ids=ids)
         self.stale: dict[int, str] = {}  # envelope labels left wrong on purpose
+        self.kinds: dict[int, str] = {}  # what each record was written as
         self.promoted: set[int] = set()  # records promoted out-of-band
+
+    def _hits(self, op: str, rid: int) -> bool:
+        """A kind-scoped mutation of ``op`` applies to record ``rid``."""
+        return self.m.op == op and self.kinds.get(rid) == self.m.scope
 
     def _wrong_cap(self, op: str, new: int) -> None:
         if self.m.op != op or self.m.scope != "cap":
             return
-        rows = self.inner.rows
+        rows = self.inner.rows  # insertion order is creation order
         if self.m.field == "durable":
-            durable = sorted(i for i, r in rows.items() if r.durable and i != new)
+            durable = [i for i, r in rows.items() if r.durable and i != new]
             if durable:
                 del rows[durable[0]]
         else:
-            plain = sorted(i for i, r in rows.items() if not r.durable)
+            plain = [i for i, r in rows.items() if not r.durable]
             if len(plain) >= CAP:
                 for i in plain[: len(plain) - (CAP - 1)]:
                     del rows[i]
@@ -1131,7 +1195,7 @@ class MutantStore:
             return
         rows = self.inner.rows
         if other is None:
-            others = sorted(i for i in rows if i != target)
+            others = [i for i in rows if i != target]  # oldest first
             other = others[0] if others else None
         if self.m.field == "created":
             self.inner._insert(c.AGENT, False, "side")  # pyright: ignore[reportPrivateUsage]
@@ -1154,11 +1218,22 @@ class MutantStore:
         else:
             self.stale[rid] = c.OPERATOR if row.trust != c.OPERATOR else c.AGENT
 
+    def _result(self, op: str, value: object) -> object:
+        """A result-flip mutation: the return value contradicts the state."""
+        if self.m.op != op or self.m.scope != "result":
+            return value
+        if isinstance(value, bool):
+            return not value
+        if op in ("write", "seed_operator"):
+            return 999_999_999  # an id that names no record
+        return 0  # prune must return nothing
+
     # --- the adapter surface ---
 
     def fresh(self) -> None:
         self.inner.fresh()
         self.stale = {}
+        self.kinds = {}
         self.promoted = set()
 
     def write(
@@ -1167,50 +1242,79 @@ class MutantStore:
         rid = self.inner.write(
             payload, source_trust=source_trust, channel=channel, durable=durable
         )
-        if self.m.op == "write" and self.m.scope in WRITE_KINDS:
-            if self.m.scope == _write_kind(source_trust, channel):
-                self.inner.rows[rid].actionable = True
-        elif self.m.scope != "cap":
+        self.kinds[rid] = _write_kind(source_trust, channel)
+        if self._hits("write", rid):
+            row = self.inner.rows[rid]
+            if self.m.field == "actionable":
+                row.actionable = True
+            else:  # "trust": stored under the wrong label
+                row.trust = _OTHER_TRUST[row.trust]
+        elif self.m.scope in ("target", "other", "store"):
             self._mutate("write", rid)
         self._wrong_cap("write", rid)
-        return rid
+        result = self._result("write", rid)
+        assert isinstance(result, int)
+        return result
 
     def seed_operator(self, payload: str) -> int:
         rid = self.inner.seed_operator(payload)
-        if self.m.scope != "cap":
+        self.kinds[rid] = "operator"
+        if self.m.scope in ("target", "other", "store"):
             self._mutate("seed_operator", rid)
         self._wrong_cap("seed_operator", rid)
-        return rid
+        result = self._result("seed_operator", rid)
+        assert isinstance(result, int)
+        return result
 
     def activate(self, record_id: int, *, channel: str) -> bool:
-        if self.m.scope == "promoted" and record_id in self.promoted:
+        kind = self.kinds.get(record_id)
+        if (
+            self.m.op == "activate_operator"
+            and self.m.field == "refused"
+            and record_id in self.promoted
+            and self.m.scope in ("promoted", f"promoted-{kind}")
+        ):
             return False  # refuses the fast path for promoted records
         op = (
             "activate_operator"
             if self.inner.rows[record_id].trust == c.OPERATOR
             else "activate_refused"
         )
+        if op == "activate_refused" and self._hits(op, record_id):
+            self.inner.rows[record_id].actionable = True  # "allowed": launders
+            return True
         result = self.inner.activate(record_id, channel=channel)
         self._mutate(op, record_id)
-        return result
+        out = self._result(op, result)
+        assert isinstance(out, bool)
+        return out
 
     def promote(self, record_id: int, *, channel: str) -> bool:
+        op = "promote_out_of_band" if channel == c.OUT_OF_BAND else "promote_in_band"
+        if self._hits(op, record_id):
+            row = self.inner.rows[record_id]
+            if op == "promote_out_of_band":
+                return row.trust == c.OPERATOR  # "refused": the ceremony is ignored
+            row.trust = c.OPERATOR  # "mint": the in-band promotion goes through
+            return True
         result = self.inner.promote(record_id, channel=channel)
         if channel == c.OUT_OF_BAND:
             self.promoted.add(record_id)
-        self._mutate(
-            "promote_out_of_band" if channel == c.OUT_OF_BAND else "promote_in_band",
-            record_id,
-        )
-        return result
+        self._mutate(op, record_id)
+        out = self._result(op, result)
+        assert isinstance(out, bool)
+        return out
 
     def prune(self) -> None:
         self.inner.prune()
-        survivors = sorted(self.inner.rows)
+        survivors = list(self.inner.rows)  # creation order
         if survivors:
             self._mutate(
                 "prune", survivors[0], survivors[-1] if len(survivors) > 1 else None
             )
+        out = self._result("prune", None)
+        if out is not None:
+            return out  # type: ignore[return-value]  # a forbidden return value
 
     def read(self, record_id: int) -> StoredRecord | None:
         r = self.inner.read(record_id)
@@ -1248,7 +1352,12 @@ def test_mutation_family_size() -> None:
     # operations that have an existing target.
     # Round 4 adds 4 write kinds coming out actionable, the promoted record that
     # refuses activation, and 4 wrong ways to keep to the cap.
-    assert len(MUTATIONS) == 7 * 2 * 5 + 7 + 7 + 5 + 4 + 1 + 4 == 98
+    # Round 5 adds a flipped return value for each of the 7 operations, and,
+    # for each of the 4 write kinds: a wrong stored label, a refused
+    # activation that goes through, an in-band promotion that mints, an
+    # out-of-band promotion that is ignored, and a promoted record that refuses
+    # activation.
+    assert len(MUTATIONS) == 98 + 7 + 4 * 5 == 125
     assert len({str(m) for m in MUTATIONS}) == len(MUTATIONS)
 
 
@@ -1333,13 +1442,149 @@ def test_an_honest_auto_pruning_store_scores_perfect() -> None:
     assert all(oracle_verdict(PolicyStore(policy)).values())
 
 
+# --- round 5 review: ids in any order, and the named cases ---
+
+ID_SCHEMES = ("increasing", "decreasing", "shuffled")
+
+
+def _external(scheme: str, n: int) -> int:
+    return {
+        "increasing": n,
+        "decreasing": 1_000_000 - n,
+        "shuffled": (n * 7919) % 1_000_003,
+    }[scheme]
+
+
+class ReferenceWithIds:
+    """The reference store behind ids handed out in another order, optionally
+    pruning to its cap on every write and seed. A conforming adapter: the
+    contract does not tie ids to creation order, and allows pruning on write."""
+
+    def __init__(self, scheme: str, auto_prune: bool) -> None:
+        self.scheme = scheme
+        self.auto = auto_prune
+        self.inner = ReferenceAdapter()
+        self.out: dict[int, int] = {}
+        self.back: dict[int, int] = {}
+
+    def _ext(self, internal: int) -> int:
+        if internal not in self.out:
+            e = _external(self.scheme, internal)
+            self.out[internal], self.back[e] = e, internal
+        return self.out[internal]
+
+    def _int(self, external: int) -> int:
+        return self.back.get(external, -1)
+
+    def fresh(self) -> None:
+        self.inner.fresh()
+        self.out, self.back = {}, {}
+
+    def write(
+        self, payload: str, *, source_trust: str | None, channel: str, durable: bool
+    ) -> int:
+        rid = self.inner.write(
+            payload, source_trust=source_trust, channel=channel, durable=durable
+        )
+        if self.auto:
+            self.inner.prune()
+        return self._ext(rid)
+
+    def seed_operator(self, payload: str) -> int:
+        rid = self.inner.seed_operator(payload)
+        if self.auto:
+            self.inner.prune()
+        return self._ext(rid)
+
+    def read(self, record_id: int) -> StoredRecord | None:
+        r = self.inner.read(self._int(record_id))
+        return None if r is None else replace(r, record_id=record_id)
+
+    def activate(self, record_id: int, *, channel: str) -> bool:
+        return self.inner.activate(self._int(record_id), channel=channel)
+
+    def promote(self, record_id: int, *, channel: str) -> bool:
+        return self.inner.promote(self._int(record_id), channel=channel)
+
+    def clamp_recorded(self, record_id: int) -> bool:
+        return self.inner.clamp_recorded(self._int(record_id))
+
+    def prune(self) -> None:
+        self.inner.prune()
+
+    def prune_cap(self) -> int:
+        return self.inner.prune_cap()
+
+    def count_records(self) -> int:
+        return self.inner.count_records()
+
+    def record_ids(self) -> list[int]:
+        return [self._ext(i) for i in self.inner.record_ids()]
+
+    def health_ok(self) -> bool:
+        return self.inner.health_ok()
+
+    def durable_violations(self) -> int:
+        return self.inner.durable_violations()
+
+    def force_durable_loss(self, record_id: int) -> None:
+        self.inner.force_durable_loss(self._int(record_id))
+
+
+@pytest.mark.parametrize("auto", [False, True], ids=["explicit-prune", "auto-prune"])
+@pytest.mark.parametrize("scheme", ID_SCHEMES)
+def test_conforming_adapters_with_ids_in_any_order_score_perfect(
+    scheme: str, auto: bool
+) -> None:
+    # Review case: an honest auto-pruning reference that hands out decreasing
+    # ids scored 0.75, because retention order was read off the ids.
+    assert score_adapter(ReferenceWithIds(scheme, auto)).perfect
+    assert all(oracle_verdict(ReferenceWithIds(scheme, auto)).values())
+    policy = replace(HONEST, auto_prune=auto)
+    assert score_adapter(PolicyStore(policy, ids=scheme)).perfect
+    assert all(oracle_verdict(PolicyStore(policy, ids=scheme)).values())
+
+
+@pytest.mark.parametrize(
+    ("case", "owner"),
+    [
+        # Review case 1: refusing every out-of-band promotion of ingested
+        # records, and refusing to activate one once promoted.
+        ("promote_out_of_band:ingested:refused", "VL-2"),
+        ("activate_operator:promoted-ingested:refused", "VL-2"),
+        # Review case 3: promotion results that contradict the state.
+        ("promote_in_band:result:flipped", "VL-2"),
+        ("promote_out_of_band:result:flipped", "VL-2"),
+    ],
+)
+def test_round_5_review_cases(case: str, owner: str) -> None:
+    m = next(m for m in MUTATIONS if str(m) == case)
+    assert m.owner == owner
+    failed = {
+        s.invariant for s in score_adapter(MutantStore(m)).invariants if not s.passed
+    }
+    assert failed == {owner}
+    assert {k for k, ok in oracle_verdict(MutantStore(m)).items() if not ok} == {owner}
+
+
 def _every_pinned_store() -> list[tuple[str, Callable[[], LedgerAdapter]]]:
     stores: list[tuple[str, Callable[[], LedgerAdapter]]] = [
         (
-            f"mutation {m} auto_prune={auto}",
-            lambda m=m, auto=auto: MutantStore(m, replace(HONEST, auto_prune=auto)),
+            f"mutation {m} auto_prune={auto} ids={ids}",
+            lambda m=m, auto=auto, ids=ids: MutantStore(
+                m, replace(HONEST, auto_prune=auto), ids
+            ),
         )
         for m in MUTATIONS
+        for auto in (False, True)
+        for ids in ID_SCHEMES
+    ]
+    stores += [
+        (
+            f"reference ids={ids} auto_prune={auto}",
+            lambda ids=ids, auto=auto: ReferenceWithIds(ids, auto),
+        )
+        for ids in ID_SCHEMES
         for auto in (False, True)
     ]
     stores += [
@@ -1384,3 +1629,15 @@ def test_suite_and_oracle_agree_on_every_pinned_store(
     # no store the suite rejects passes the oracle, on every mutation and every
     # hand-written store, with and without pruning on write.
     assert suite_verdict(make()) == oracle_verdict(make()), name
+
+
+@given(policy=policies, ids=st.sampled_from(ID_SCHEMES))
+def test_suite_and_oracle_agree_whatever_order_ids_come_in(
+    policy: Policy, ids: str
+) -> None:
+    # The exhaustive family test uses increasing ids; this samples the same
+    # family under every id order, since retention must follow creation order,
+    # never id order.
+    assert suite_verdict(PolicyStore(policy, ids=ids)) == oracle_verdict(
+        PolicyStore(policy, ids=ids)
+    )

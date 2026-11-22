@@ -1,8 +1,8 @@
 """Positive and adversarial probes, per invariant. See SPEC.md § "Conformance scoring".
 
 Positive probes assert the legitimate path still works; adversarial probes assert
-the attack is blocked. An invariant passes only when both hold, which is what
-makes the score un-gameable: a block-everything store fails the positives, an
+the attack is blocked. An invariant passes only when both hold, so neither
+degenerate store scores well: a block-everything store fails the positives, an
 allow-everything store fails the adversarials.
 
 The suite is one rule applied to one set of scenarios. :data:`SCENARIOS` is a
@@ -26,7 +26,7 @@ receives a store on a clean slate (``fresh()``).
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from verification_ledger.conformance.contract import (
@@ -195,8 +195,14 @@ def violations(
     target: int | None,
     new_record: Mapping[str, object] | None = None,
     cap: int = 0,
+    order: Sequence[int] = (),
 ) -> set[str]:
-    """The invariants whose part of the contract this one operation broke."""
+    """The invariants whose part of the contract this one operation broke.
+
+    ``order`` is the creation order of the records the caller created, oldest
+    first, as the caller observed it. Record ids carry no order: the adapter
+    contract lets a store hand out ids in any order.
+    """
     allowed = ALLOWED_DELTAS[op]
     owner = OWNERS[op]
     found: set[str] = set()
@@ -218,7 +224,11 @@ def violations(
             found.add(owner["removed"])
     elif allowed.removes == "cap":
         if removed:
-            plain = sorted(i for i, v in before.records.items() if v.durable is False)
+            plain = [
+                i
+                for i in order
+                if i in before.records and before.records[i].durable is False
+            ]
             left = [i for i, v in after.records.items() if v.durable is False]
             if removed != set(plain[: len(removed)]) or len(left) < cap:
                 found.add(owner["removed"])
@@ -291,17 +301,33 @@ def _legitimate_writes(cap: int) -> list[Step]:
     ]
 
 
+# Every kind of record a writer can ask for: agent, ingested, unlabeled, and an
+# in-band operator request (stored clamped to agent).
+WRITE_REQUESTS: tuple[tuple[str, str | None], ...] = (
+    ("agent", AGENT),
+    ("ingested", INGESTED),
+    ("unlabeled", None),
+    ("clamped", OPERATOR),
+)
+
+
 def _operator_fast_path(cap: int) -> list[Step]:
-    # Seeded operator records and records promoted out-of-band both activate in
-    # one in-band call.
-    return [
+    # Seeded operator records, and records of every kind once promoted
+    # out-of-band, activate in one in-band call. An in-band promotion of a
+    # record that is already operator reports that it is operator.
+    steps = [
         *_others(),
         Step("seed", "directive"),
+        Step("promote", "directive", channel=IN_BAND),
         Step("activate", "directive"),
-        Step("write", "ceremony", AGENT),
-        Step("promote", "ceremony", channel=OUT_OF_BAND),
-        Step("activate", "ceremony"),
     ]
+    for label, trust in WRITE_REQUESTS:
+        steps += [
+            Step("write", f"ceremony-{label}", trust),
+            Step("promote", f"ceremony-{label}", channel=OUT_OF_BAND),
+            Step("activate", f"ceremony-{label}"),
+        ]
+    return steps
 
 
 def _retention_to_cap(cap: int) -> list[Step]:
@@ -314,10 +340,10 @@ def _retention_to_cap(cap: int) -> list[Step]:
 
 
 def _laundering_attacks(cap: int) -> list[Step]:
-    # An in-band operator mint, ingested and agent content: each written, then
-    # activated in-band and promoted in-band, which must all be refused.
+    # Every kind of non-operator record, written, then activated in-band and
+    # promoted in-band, which must all be refused.
     steps = _others()
-    for label, trust in (("minted", OPERATOR), ("scraped", INGESTED), ("work", AGENT)):
+    for label, trust in WRITE_REQUESTS:
         steps += [
             Step("write", label, trust),
             Step("activate", label),
@@ -363,10 +389,18 @@ SCENARIOS: tuple[Scenario, ...] = (
 
 def run_scenario(a: LedgerAdapter, scenario: Scenario) -> set[str]:
     """Run one scenario on a clean store; return every invariant it caught
-    violating, whichever step or invariant the scenario was written for."""
+    violating, whichever step or invariant the scenario was written for.
+
+    Besides the state deltas, every value the contract defines an operation to
+    return is checked: a write or seed returns the id of the one record it
+    created, activate whether the record is now actionable, promote whether it
+    is now operator, prune nothing. Creation order is the order this run saw
+    records appear, never the numeric order of their ids.
+    """
     a.fresh()
     found: set[str] = set()
     ids: dict[str, int] = {}
+    order: list[int] = []
     cap = a.prune_cap()
 
     def step(
@@ -377,14 +411,30 @@ def run_scenario(a: LedgerAdapter, scenario: Scenario) -> set[str]:
     ) -> object:
         before = snapshot(a)
         result = call()
-        if target is None and isinstance(result, int) and not isinstance(result, bool):
-            tid: int | None = result
-        else:
-            tid = target
+        after = snapshot(a)
+        created = set(after.records) - set(before.records)
+        returned_id = isinstance(result, int) and not isinstance(result, bool)
+        tid = result if target is None and returned_id else target
+        assert tid is None or isinstance(tid, int)
+        if ALLOWED_DELTAS[op].creates and tid not in created:
+            # The returned value does not name the record the call created.
+            found.add(OWNERS[op]["created"])
+            if len(created) == 1:
+                tid = next(iter(created))  # judge the record it did create
         found.update(
-            violations(op, before, snapshot(a), target=tid, new_record=new, cap=cap)
+            violations(
+                op,
+                before,
+                after,
+                target=tid,
+                new_record=new,
+                cap=cap,
+                order=order,
+            )
         )
-        return result
+        order.extend(i for i in [tid] if i in created)
+        order.extend(sorted(created - set(order)))
+        return tid if ALLOWED_DELTAS[op].creates else result
 
     for s in scenario.steps(cap):
         if s.op == "write":
@@ -396,11 +446,11 @@ def run_scenario(a: LedgerAdapter, scenario: Scenario) -> set[str]:
                 None,
                 _expected_write(s.trust, s.channel, s.name, s.durable),
             )
-            assert isinstance(rid, int)
-            ids[s.name] = rid
-            clamp = s.trust == OPERATOR and s.channel == IN_BAND
-            if a.clamp_recorded(rid) is not clamp:
-                found.add("VL-1")
+            if isinstance(rid, int) and not isinstance(rid, bool):
+                ids[s.name] = rid
+                clamp = s.trust == OPERATOR and s.channel == IN_BAND
+                if a.clamp_recorded(rid) is not clamp:
+                    found.add("VL-1")
         elif s.op == "seed":
             rid = step(
                 "seed_operator",
@@ -408,13 +458,13 @@ def run_scenario(a: LedgerAdapter, scenario: Scenario) -> set[str]:
                 None,
                 {"payload": s.name},
             )
-            assert isinstance(rid, int)
-            ids[s.name] = rid
+            if isinstance(rid, int) and not isinstance(rid, bool):
+                ids[s.name] = rid
         elif s.op in ("activate", "promote"):
-            rid = ids[s.name]
-            view = snapshot(a).records.get(rid)
-            if view is None:
-                continue  # already reported as a dropped record
+            rid = ids.get(s.name)
+            view = None if rid is None else snapshot(a).records.get(rid)
+            if rid is None or view is None:
+                continue  # already reported
             if s.op == "activate":
                 operator = view.trust == OPERATOR
                 op = "activate_operator" if operator else "activate_refused"
@@ -422,19 +472,21 @@ def run_scenario(a: LedgerAdapter, scenario: Scenario) -> set[str]:
                 if result is not operator:
                     found.add(OWNERS[op]["actionable"])
             else:
-                op = (
-                    "promote_out_of_band"
-                    if s.channel == OUT_OF_BAND
-                    else "promote_in_band"
+                oob = s.channel == OUT_OF_BAND
+                op = "promote_out_of_band" if oob else "promote_in_band"
+                result = step(
+                    op, lambda rid=rid, s=s: a.promote(rid, channel=s.channel), rid
                 )
-                step(op, lambda rid=rid, s=s: a.promote(rid, channel=s.channel), rid)
+                if result is not (oob or view.trust == OPERATOR):
+                    found.add(OWNERS[op]["trust"])  # "whether it is now operator"
         elif s.op == "prune":
-            step("prune", a.prune, None)
+            if step("prune", a.prune, None) is not None:
+                found.add(OWNERS["prune"]["removed"])
         elif s.op == "expect_healthy":
             if a.health_ok() is not True or a.durable_violations() != 0:
                 found.add("VL-4")
         elif s.op == "force_loss":
-            if ids[s.name] in snapshot(a).records:
+            if s.name in ids and ids[s.name] in snapshot(a).records:
                 a.force_durable_loss(ids[s.name])
         elif s.op == "expect_loss_reported":
             if a.health_ok() is not False or a.durable_violations() <= 0:
