@@ -7,9 +7,6 @@ on:
   schedule:
     - cron: "17 10 * * 0"
   workflow_dispatch:
-  # Temporary: one full run from this branch before merge. Removed next commit.
-  push:
-    branches: [fix/ledger-suite-soundness]
 
 permissions:
   contents: read
