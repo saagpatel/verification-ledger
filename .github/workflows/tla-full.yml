@@ -1,0 +1,49 @@
+name: TLC full
+
+# The long passing TLC configurations, which take from minutes to hours each.
+# One job per configuration, so each gets its own time budget. Run weekly and
+# on demand rather than on every pull request.
+on:
+  schedule:
+    - cron: "17 10 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tla:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - VerificationLedger
+          - Control_GateDecisionOnly
+          - Control_PruneSelectionOnly
+          - Finding_ReceiptErased
+    env:
+      TLA2TOOLS: /tmp/tla2tools.jar
+      TLA2TOOLS_URL: https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+      TLA2TOOLS_SHA256: 936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
+      TLC_HEAP: 10g
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Java
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Fetch TLC
+        run: |
+          curl -fsSL -o "$TLA2TOOLS" "$TLA2TOOLS_URL"
+          echo "$TLA2TOOLS_SHA256  $TLA2TOOLS" | sha256sum -c -
+      - name: Model check
+        run: specs/tla/run.sh "${{ matrix.config }}"
+      - name: Keep TLC log
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tlc-log-${{ matrix.config }}
+          path: specs/tla/out/
