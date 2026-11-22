@@ -123,8 +123,11 @@ The top-line **Ledger Conformance Score** is the fraction of the four invariants
 fully passed (`0.0`–`1.0`). The metric is bidirectional by construction, so
 neither degenerate store scores well:
 
-- A **block-everything** store fails the positive probes of VL-1 and VL-2 (the
-  operator fast path is broken).
+- A **block-everything** store fails the positive probes of VL-2 (the operator
+  fast path and the out-of-band promotion are broken). Blocking the gate does
+  not touch VL-1, whose positive probes only check that labels are stored as
+  written; a store that also refuses to keep labels (say, stores every write as
+  `ingested`) fails VL-1's positive probes too.
 - An **allow-everything** store fails the adversarial probes of VL-1 and VL-2
   (laundering is not blocked).
 
@@ -153,6 +156,19 @@ the same way, rather than assuming the reference's:
   with a configurable cap are graded identically. `prune()` takes no argument: it
   prunes to the store's own cap, and a store that auto-prunes on write may make it
   a no-op.
+
+Three more methods let the probes check the parts of each pass condition that a
+read alone cannot show, again in the store's own terms:
+
+- **`write(..., source_trust=None)`**: no label at all, so the VL-1 probe can
+  check the write default.
+- **`clamp_recorded(record_id)`**: whether the store recorded a VL-1 clamp for
+  that write (the reference keeps it on the write result; another store may keep
+  a column or an audit row).
+- **`durable_violations()`** and **`force_durable_loss(record_id)`**: the store's
+  VL-4 violation counter, and a test hook that destroys a durable record behind
+  the API the way housekeeping SQL or a crash would. The VL-4 adversarial probe
+  forces a loss and requires health to report it with a non-zero counter.
 
 The suite runs entirely against this protocol, so it grades the bundled reference
 implementation and any third-party store the same way. The suite is the standard;

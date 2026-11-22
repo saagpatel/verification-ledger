@@ -23,20 +23,33 @@ class ReferenceAdapter:
         # REPORT policy: a VL-4 violation degrades health_ok() rather than raising,
         # so the suite reads a boolean instead of catching an exception.
         self._led = Ledger(":memory:", policy=FailurePolicy.REPORT)
+        # The reference records a clamp on the WriteResult it returns; the
+        # adapter keeps those flags so the suite can ask about them per record.
+        self._clamped: set[int] = set()
 
     def fresh(self) -> None:
         self._led.close()
         self._led = Ledger(":memory:", policy=FailurePolicy.REPORT)
+        self._clamped = set()
 
     def write(
-        self, payload: str, *, source_trust: str, channel: str, durable: bool
+        self, payload: str, *, source_trust: str | None, channel: str, durable: bool
     ) -> int:
-        return self._led.write(
-            payload,
-            source_trust=Trust(source_trust),
-            channel=Channel(channel),
-            durable=durable,
-        ).record_id
+        if source_trust is None:
+            result = self._led.write(payload, channel=Channel(channel), durable=durable)
+        else:
+            result = self._led.write(
+                payload,
+                source_trust=Trust(source_trust),
+                channel=Channel(channel),
+                durable=durable,
+            )
+        if result.clamped:
+            self._clamped.add(result.record_id)
+        return result.record_id
+
+    def clamp_recorded(self, record_id: int) -> bool:
+        return record_id in self._clamped
 
     def read(self, record_id: int) -> StoredRecord | None:
         enveloped = self._led.read(record_id)
@@ -83,3 +96,13 @@ class ReferenceAdapter:
 
     def health_ok(self) -> bool:
         return self._led.health().ok
+
+    def durable_violations(self) -> int:
+        return self._led.health().durable_orphans
+
+    def force_durable_loss(self, record_id: int) -> None:
+        # Store-level deletion behind the API: the ledger exposes no delete, so
+        # this reaches the connection directly, as housekeeping SQL would.
+        conn = self._led._conn  # pyright: ignore[reportPrivateUsage]
+        conn.execute("DELETE FROM records WHERE id = ?", (record_id,))
+        conn.commit()

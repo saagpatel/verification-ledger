@@ -43,30 +43,74 @@ def _correct_prune(rows: dict[int, _Row], keep: int) -> None:
         del rows[i]
 
 
-class _AllowEverythingAdapter:
-    """No clamp; activation and promotion always succeed. Fails VL-1 and VL-2."""
+class _DoubleBase:
+    """Honest storage, envelope, retention and health shared by the doubles.
+
+    Each double below overrides only the mechanism it gets wrong, so it fails
+    exactly the invariant that mechanism belongs to.
+    """
 
     def __init__(self) -> None:
         self._rows: dict[int, _Row] = {}
+        self._receipts: set[int] = set()
+        self._clamped: set[int] = set()
         self._next = 1
 
     def fresh(self) -> None:
-        self._rows = {}
-        self._next = 1
+        self.__init__()
 
-    def write(
-        self, payload: str, *, source_trust: str, channel: str, durable: bool
-    ) -> int:
+    def _store(self, trust: str, actionable: bool, durable: bool, clamped: bool) -> int:
         rid = self._next
         self._next += 1
-        self._rows[rid] = _Row(source_trust, False, durable)  # no clamp
+        self._rows[rid] = _Row(trust, actionable, durable)
+        if durable:
+            self._receipts.add(rid)
+        if clamped:
+            self._clamped.add(rid)
         return rid
+
+    def clamp_recorded(self, record_id: int) -> bool:
+        return record_id in self._clamped
 
     def read(self, record_id: int) -> StoredRecord | None:
         row = self._rows.get(record_id)
         if row is None:
             return None
         return StoredRecord(record_id, row.trust, row.actionable, _envelope(row.trust))
+
+    def seed_operator(self, payload: str) -> int:
+        return self._store(c.OPERATOR, False, False, False)
+
+    def prune(self) -> None:
+        _correct_prune(self._rows, _DOUBLE_CAP)
+
+    def prune_cap(self) -> int:
+        return _DOUBLE_CAP
+
+    def count_records(self) -> int:
+        return len(self._rows)
+
+    def durable_violations(self) -> int:
+        return sum(
+            1
+            for r in self._receipts
+            if r not in self._rows or not self._rows[r].durable
+        )
+
+    def health_ok(self) -> bool:
+        return self.durable_violations() == 0
+
+    def force_durable_loss(self, record_id: int) -> None:
+        del self._rows[record_id]
+
+
+class _AllowEverythingAdapter(_DoubleBase):
+    """No clamp; activation and promotion always succeed. Fails VL-1 and VL-2."""
+
+    def write(
+        self, payload: str, *, source_trust: str | None, channel: str, durable: bool
+    ) -> int:
+        return self._store(source_trust or c.AGENT, False, durable, False)  # no clamp
 
     def activate(self, record_id: int, *, channel: str) -> bool:
         self._rows[record_id].actionable = True
@@ -76,51 +120,18 @@ class _AllowEverythingAdapter:
         self._rows[record_id].trust = "operator"  # even in-band
         return True
 
-    def seed_operator(self, payload: str) -> int:
-        return self.write(
-            payload, source_trust=c.OPERATOR, channel=c.OUT_OF_BAND, durable=False
-        )
 
-    def prune(self) -> None:
-        _correct_prune(self._rows, _DOUBLE_CAP)
-
-    def prune_cap(self) -> int:
-        return _DOUBLE_CAP
-
-    def count_records(self) -> int:
-        return len(self._rows)
-
-    def health_ok(self) -> bool:
-        return True
-
-
-class _BlockEverythingAdapter:
+class _BlockEverythingAdapter(_DoubleBase):
     """Correct clamp and storage, but nothing ever activates or promotes. Fails VL-2."""
 
-    def __init__(self) -> None:
-        self._rows: dict[int, _Row] = {}
-        self._next = 1
-
-    def fresh(self) -> None:
-        self._rows = {}
-        self._next = 1
-
     def write(
-        self, payload: str, *, source_trust: str, channel: str, durable: bool
+        self, payload: str, *, source_trust: str | None, channel: str, durable: bool
     ) -> int:
-        trust = source_trust
-        if source_trust == c.OPERATOR and channel == c.IN_BAND:
+        trust = source_trust or c.AGENT
+        clamped = trust == c.OPERATOR and channel == c.IN_BAND
+        if clamped:
             trust = c.AGENT  # correct clamp
-        rid = self._next
-        self._next += 1
-        self._rows[rid] = _Row(trust, False, durable)
-        return rid
-
-    def read(self, record_id: int) -> StoredRecord | None:
-        row = self._rows.get(record_id)
-        if row is None:
-            return None
-        return StoredRecord(record_id, row.trust, row.actionable, _envelope(row.trust))
+        return self._store(trust, False, durable, clamped)
 
     def activate(self, record_id: int, *, channel: str) -> bool:
         return False  # blocks the legitimate fast path too
@@ -128,25 +139,8 @@ class _BlockEverythingAdapter:
     def promote(self, record_id: int, *, channel: str) -> bool:
         return False
 
-    def seed_operator(self, payload: str) -> int:
-        return self.write(
-            payload, source_trust=c.OPERATOR, channel=c.OUT_OF_BAND, durable=False
-        )
 
-    def prune(self) -> None:
-        _correct_prune(self._rows, _DOUBLE_CAP)
-
-    def prune_cap(self) -> int:
-        return _DOUBLE_CAP
-
-    def count_records(self) -> int:
-        return len(self._rows)
-
-    def health_ok(self) -> bool:
-        return True
-
-
-class _BornActionableAdapter:
+class _BornActionableAdapter(_DoubleBase):
     """Honest VL-1/VL-3/VL-4, but every record is born actionable while activate()
     merely reports ``trust == operator``. This is the laundering store the red-team
     built: a downstream consumer reading ``StoredRecord.actionable`` acts on
@@ -154,30 +148,17 @@ class _BornActionableAdapter:
     VL-2 now that the probes assert persisted state.
     """
 
-    def __init__(self) -> None:
-        self._rows: dict[int, _Row] = {}
-        self._next = 1
-
-    def fresh(self) -> None:
-        self._rows = {}
-        self._next = 1
-
     def write(
-        self, payload: str, *, source_trust: str, channel: str, durable: bool
+        self, payload: str, *, source_trust: str | None, channel: str, durable: bool
     ) -> int:
-        trust = source_trust
-        if source_trust == c.OPERATOR and channel == c.IN_BAND:
+        trust = source_trust or c.AGENT
+        clamped = trust == c.OPERATOR and channel == c.IN_BAND
+        if clamped:
             trust = c.AGENT  # honest clamp
-        rid = self._next
-        self._next += 1
-        self._rows[rid] = _Row(trust, True, durable)  # BORN ACTIONABLE
-        return rid
+        return self._store(trust, True, durable, clamped)  # BORN ACTIONABLE
 
-    def read(self, record_id: int) -> StoredRecord | None:
-        row = self._rows.get(record_id)
-        if row is None:
-            return None
-        return StoredRecord(record_id, row.trust, row.actionable, _envelope(row.trust))
+    def seed_operator(self, payload: str) -> int:
+        return self._store(c.OPERATOR, True, False, False)
 
     def activate(self, record_id: int, *, channel: str) -> bool:
         return self._rows[record_id].trust == c.OPERATOR  # reports refused for agent
@@ -187,23 +168,6 @@ class _BornActionableAdapter:
             self._rows[record_id].trust = c.OPERATOR
             return True
         return False
-
-    def seed_operator(self, payload: str) -> int:
-        return self.write(
-            payload, source_trust=c.OPERATOR, channel=c.OUT_OF_BAND, durable=False
-        )
-
-    def prune(self) -> None:
-        _correct_prune(self._rows, _DOUBLE_CAP)
-
-    def prune_cap(self) -> int:
-        return _DOUBLE_CAP
-
-    def count_records(self) -> int:
-        return len(self._rows)
-
-    def health_ok(self) -> bool:
-        return True
 
 
 def test_reference_scores_perfect() -> None:
