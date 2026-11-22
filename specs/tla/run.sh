@@ -39,6 +39,8 @@ expected() {
         Control_HealthIgnoresChainMeta) echo "VL4_LossDetected" ;;
         Control_ConsistentChainRewrite) echo "VL4_LossDetected" ;;
         Finding_ReceiptErased) echo "pass" ;;
+        Check_MetaErased) echo "pass" ;;
+        Control_WriteRecreatesMeta) echo "VL4_LossDetected" ;;
         Witness_FastPath) echo "NoRecordEverActionable" ;;
         *) echo "unknown" ;;
     esac
@@ -51,7 +53,8 @@ else
              Control_NoClamp Control_PromotionIgnoresChannel
              Control_PruneSelectionOnly Control_PruneIgnoresDurable
              Control_HealthIgnoresDigest Control_HealthIgnoresChainMeta
-             Control_ConsistentChainRewrite Finding_ReceiptErased Witness_FastPath)
+             Control_ConsistentChainRewrite Control_WriteRecreatesMeta
+             Finding_ReceiptErased Check_MetaErased Witness_FastPath)
 fi
 
 status=0

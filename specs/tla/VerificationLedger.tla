@@ -34,7 +34,10 @@ CONSTANTS
     \* adversary with store-level access (outside the API)
     StoreTamper,            \* may delete, demote or overwrite a row, leaving receipts alone
     ReceiptTamper,          \* may delete a durable receipt, with or without its row
-    ChainRewrite            \* may overwrite or erase and then rewrite the chain consistently
+    MetaTamper,             \* may delete the chain metadata (the ledger_meta rows)
+    ChainRewrite,           \* may overwrite or erase and then rewrite the chain consistently
+    \* broken variant of write(), for a control
+    WriteRecreatesMeta      \* a durable write recreates missing metadata (the bug fixed in round 2)
 
 Ids     == 1..MaxRecords
 Trusts  == {"operator", "agent", "ingested"}
@@ -57,6 +60,7 @@ VARIABLES
     rhash,       \* receipt receipt_hash: an ideal hash, the sequence of digests so far
     metaCount,   \* ledger_meta durable_count
     metaHead,    \* ledger_meta durable_head
+    metaPresent, \* the ledger_meta rows exist
     pc,          \* per-agent pending second statement
     \* ghost state, for stating the invariants
     mintedOOB,   \* operator trust on this record was minted out-of-band
@@ -64,7 +68,7 @@ VARIABLES
     tampered,    \* touched by the store-level adversary
     last         \* the last action, for per-step invariants
 
-integ == <<content, rdigest, rprev, rhash, metaCount, metaHead>>
+integ == <<content, rdigest, rprev, rhash, metaCount, metaHead, metaPresent>>
 data == <<nextId, present, trust, durable, actionable, receipts, integ>>
 vars == <<data, pc, mintedOOB, wroteDurable, tampered, last>>
 
@@ -88,7 +92,7 @@ ExpectedPrev(r) == LET before == {k \in receipts : k < r}
                    IN IF before = {} THEN Genesis ELSE rhash[Max(before)]
 LinkOk(r) == rprev[r] = ExpectedPrev(r) /\ rhash[r] = Link(rprev[r], rdigest[r])
 ChainHead == IF receipts = {} THEN Genesis ELSE rhash[Max(receipts)]
-MetaOk == metaCount = Cardinality(receipts) /\ metaHead = ChainHead
+MetaOk == metaPresent /\ metaCount = Cardinality(receipts) /\ metaHead = ChainHead
 HealthOk ==
     /\ MissingRecords = {}
     /\ MissingReceipts = {}
@@ -113,9 +117,10 @@ TypeOK ==
     /\ receipts \subseteq Ids
     /\ content \in [Ids -> 0..1]
     /\ metaCount \in 0..MaxRecords
+    /\ metaPresent \in BOOLEAN
     /\ mintedOOB \in [Ids -> BOOLEAN]
     /\ wroteDurable \in [Ids -> BOOLEAN]
-    /\ tampered \subseteq Ids
+    /\ tampered \subseteq Ids \cup {0}   \* 0 marks tampered metadata
 
 Init ==
     /\ nextId = 1
@@ -130,6 +135,7 @@ Init ==
     /\ rhash = [i \in Ids |-> Genesis]
     /\ metaCount = 0
     /\ metaHead = Genesis
+    /\ metaPresent = TRUE
     /\ pc = [a \in Agents |-> Idle]
     /\ mintedOOB = [i \in Ids |-> FALSE]
     /\ wroteDurable = [i \in Ids |-> FALSE]
@@ -143,7 +149,11 @@ DoWrite(t, inBand, d) ==
     LET id == nextId
         s  == Stored(t, inBand)
         dg == <<id, 0>>
-        ln == Link(metaHead, dg)
+        \* write() links from the recorded head, or from genesis when the
+        \* metadata is missing, and never recreates missing metadata.
+        hd == IF metaPresent THEN metaHead ELSE Genesis
+        ln == Link(hd, dg)
+        keep == metaPresent \/ WriteRecreatesMeta
     IN
     /\ nextId <= MaxRecords
     /\ nextId' = nextId + 1
@@ -153,10 +163,11 @@ DoWrite(t, inBand, d) ==
     /\ actionable' = [actionable EXCEPT ![id] = FALSE]
     /\ receipts' = IF d THEN receipts \cup {id} ELSE receipts
     /\ rdigest' = IF d THEN [rdigest EXCEPT ![id] = dg] ELSE rdigest
-    /\ rprev' = IF d THEN [rprev EXCEPT ![id] = metaHead] ELSE rprev
+    /\ rprev' = IF d THEN [rprev EXCEPT ![id] = hd] ELSE rprev
     /\ rhash' = IF d THEN [rhash EXCEPT ![id] = ln] ELSE rhash
-    /\ metaCount' = IF d THEN metaCount + 1 ELSE metaCount
-    /\ metaHead' = IF d THEN ln ELSE metaHead
+    /\ metaCount' = IF d /\ keep THEN (IF metaPresent THEN metaCount + 1 ELSE 1) ELSE metaCount
+    /\ metaHead' = IF d /\ keep THEN ln ELSE metaHead
+    /\ metaPresent' = IF d /\ keep THEN TRUE ELSE metaPresent
     /\ mintedOOB' = [mintedOOB EXCEPT ![id] = (s = "operator" /\ ~inBand)]
     /\ wroteDurable' = [wroteDurable EXCEPT ![id] = d]
     /\ last' = [kind |-> "write", id |-> id, req |-> t, inBand |-> inBand,
@@ -250,7 +261,7 @@ TamperOverwrite(i) ==
     /\ tampered' = tampered \cup {i}
     /\ last' = Act("tamper_overwrite", i)
     /\ UNCHANGED <<nextId, present, trust, durable, actionable, receipts, rdigest, rprev,
-                   rhash, metaCount, metaHead, pc, mintedOOB, wroteDurable>>
+                   rhash, metaCount, metaHead, metaPresent, pc, mintedOOB, wroteDurable>>
 
 \* Store-level adversary that also removes the evidence: a durable receipt,
 \* with or without its row, anywhere in the chain.
@@ -262,6 +273,15 @@ TamperErase(i, withRow) ==
     /\ last' = Act("tamper_erase", i)
     /\ UNCHANGED <<nextId, trust, durable, actionable, integ, pc, mintedOOB, wroteDurable>>
 
+\* Store-level adversary: delete the chain metadata rows.
+TamperMeta ==
+    /\ MetaTamper /\ metaPresent
+    /\ metaPresent' = FALSE
+    /\ tampered' = tampered \cup {0}
+    /\ last' = Act("tamper_meta", 0)
+    /\ UNCHANGED <<nextId, present, trust, durable, actionable, receipts, content, rdigest,
+                   rprev, rhash, metaCount, metaHead, pc, mintedOOB, wroteDurable>>
+
 \* Out of scope (no anchor outside the store): change a durable record, then
 \* recompute every digest, link and the metadata so the chain verifies.
 Rechain(R, dig) ==
@@ -270,6 +290,7 @@ Rechain(R, dig) ==
     /\ rhash' = [j \in Ids |-> IF j \in R THEN ChainOf({k \in R : k <= j}, dig) ELSE rhash[j]]
     /\ metaCount' = Cardinality(R)
     /\ metaHead' = ChainOf(R, dig)
+    /\ metaPresent' = TRUE
 
 RewriteOverwrite(i) ==
     /\ ChainRewrite /\ i \in Live /\ durable[i] /\ i \in receipts /\ content[i] = 0
@@ -297,6 +318,7 @@ Next ==
     \/ \E i \in Ids : \/ OperatorPromote(i) \/ TamperDelete(i) \/ TamperDemote(i)
                      \/ TamperOverwrite(i) \/ RewriteOverwrite(i) \/ RewriteErase(i)
     \/ \E i \in Ids, w \in BOOLEAN : TamperErase(i, w)
+    \/ TamperMeta
 
 Spec == Init /\ [][Next]_vars
 
