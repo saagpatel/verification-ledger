@@ -110,6 +110,39 @@ never pass unnoticed.
 orphan or durable loss is reported by health with a non-zero counter under both
 failure policies.
 
+The reference store makes the evidence tamper-evident, not only present. Each
+durable record's receipt carries a SHA-256 digest of the record's content (id,
+payload, creation time) and a link hash over the previous receipt, and the
+store's metadata keeps the chain's length and head. Health re-verifies the
+chain and counts four kinds of violation separately: overwritten content
+(digest mismatch), a missing or demoted record, a durable record with no
+receipt, and a broken chain (a receipt removed or altered anywhere, including
+the newest one). Health reads all of its inputs in one read transaction, so a
+legitimate write committed concurrently is never reported as a violation.
+
+Stores written before the chain existed are migrated once, when opened. The
+migration runs only on a genuine pre-chain store: its receipts table has none
+of the integrity columns and its metadata has no schema version. It fills a
+digest and link for every receipt from its record's current content and
+records the schema version. Any other shape is a chain-schema store, intact or
+damaged (some integrity columns missing, a version with columns missing,
+columns without a version, a missing table): startup re-creates missing tables
+and columns empty so the store stays usable, but never writes a digest, link,
+metadata row or schema version, and never reuses the id of a receipted record.
+The damage, like NULL integrity fields or missing metadata, is reported as
+chain breaks; neither reopening the store nor a later write repairs it.
+
+*Scope of detection:* the chain, its metadata and the records live in the same
+store, and the hash has no key. A writer with direct write access who changes
+records, receipts and metadata consistently (recomputing every digest and link
+after the change) leaves a store that verifies. Detecting that needs an anchor
+the writer cannot reach, such as the head hash recorded outside the store; the
+reference ships none. The same holds for a writer who rebuilds the pre-chain
+schema completely (drops every integrity column and the schema version) so
+that the next open migrates the store again, or who drops every ledger table
+so the store looks new: those are consistent rewrites of the evidence too. The migration also trusts the content it finds: an
+overwrite made before a store was migrated is not detectable afterwards.
+
 ## Conformance scoring
 
 The conformance suite runs, per invariant, a set of **positive probes** (the
@@ -123,8 +156,11 @@ The top-line **Ledger Conformance Score** is the fraction of the four invariants
 fully passed (`0.0`–`1.0`). The metric is bidirectional by construction, so
 neither degenerate store scores well:
 
-- A **block-everything** store fails the positive probes of VL-1 and VL-2 (the
-  operator fast path is broken).
+- A **block-everything** store fails the positive probes of VL-2 (the operator
+  fast path and the out-of-band promotion are broken). Blocking the gate does
+  not touch VL-1, whose positive probes only check that labels are stored as
+  written; a store that also refuses to keep labels (say, stores every write as
+  `ingested`) fails VL-1's positive probes too.
 - An **allow-everything** store fails the adversarial probes of VL-1 and VL-2
   (laundering is not blocked).
 
