@@ -1,8 +1,8 @@
 # The Verification Ledger Contract
 
 Version 1 (draft). This document is the product. The reference implementation and
-the conformance suite in this repository exist to prove the contract is
-satisfiable and to let any store demonstrate it enforces the contract.
+the conformance suite in this repository exist to show the contract is
+satisfiable and to test how a store enforces it.
 
 ## Why this exists
 
@@ -20,9 +20,10 @@ failure modes:
 
 A README that says "please label your handoffs" or "don't prune shipped rows" is
 a *word-level* guarantee: it holds roughly as often as everyone remembers to
-follow it. The Verification Ledger turns those two guarantees into *mechanisms* —
-properties of the store that hold regardless of what any agent does — and ships a
-conformance suite that mechanically proves a given store enforces them.
+follow it. The Verification Ledger turns those two guarantees into *mechanisms*:
+properties of the store that hold regardless of what any agent does. It ships a
+conformance suite that tests a store against them; what that test establishes,
+and what no test can, is stated under "What the suite establishes" below.
 
 ## The trust model
 
@@ -167,6 +168,28 @@ neither degenerate store scores well:
 Only a store that keeps the legitimate path open *and* closes the laundering path
 scores `1.0`. The bundled reference implementation is required to score `1.0`.
 
+### What the suite establishes
+
+The claim is a testable one. The suite fails every store in the documented
+mutation family on exactly the invariant that store breaks, passes the reference
+store and its documented conforming variants, and agrees with the independent
+oracle on all of them. The family is in the property tests:
+
+- 36864 configurable stores, each a mix of honest and broken mechanisms, checked
+  exhaustively;
+- 125 generated mutations: every operation, every field of the target and of
+  another record, side and dropped records, every return value the contract
+  defines, and every kind of record (agent, ingested, unlabeled, clamped
+  operator request) through every gate operation;
+- conforming variants that must score 1.00: ids handed out in increasing,
+  decreasing and shuffled order, with and without pruning on write.
+
+No finite suite proves soundness against every possible adapter. A store can
+behave correctly on every scripted scenario and still misbehave on inputs,
+sequences or timings the scenarios do not reach. A score of 1.00 is evidence
+against the documented family, not a proof that an arbitrary store enforces the
+contract.
+
 ## The adapter contract
 
 A store demonstrates conformance by implementing a small adapter against the
@@ -189,6 +212,53 @@ the same way, rather than assuming the reference's:
   with a configurable cap are graded identically. `prune()` takes no argument: it
   prunes to the store's own cap, and a store that auto-prunes on write may make it
   a no-op.
+
+More hooks let the probes check the parts of each pass condition that a single
+read cannot show, again in the store's own terms:
+
+- **`write(..., source_trust=None)`**: no label at all, so the VL-1 probe can
+  check the write default.
+- **`clamp_recorded(record_id)`**: whether the store recorded a VL-1 clamp for
+  that write (the reference keeps it on the write result; another store may keep
+  a column or an audit row).
+- **`record_ids()`**: every record the store holds, so a probe can read back the
+  store's complete state, not only the records it wrote.
+- **`durable_violations()`** and **`force_durable_loss(record_id)`**: the store's
+  VL-4 violation counter, and a test hook that destroys a durable record behind
+  the API the way housekeeping SQL or a crash would. The VL-4 adversarial probe
+  forces a loss and requires health to report it with a non-zero counter.
+
+A read (`StoredRecord`) exposes each record's label, actionability, envelope,
+payload and durability. Every probe follows one rule. Before and after each
+mutating operation it takes a full-state snapshot: every listed record, read
+back through `read()` as a consumer would get it, plus the record count. It
+then checks the change against one allowed-delta table. Anything the table does
+not allow must be identical, on every record:
+
+| Operation | Allowed change | Owner of a violation |
+|---|---|---|
+| write | one new record: its label by the VL-1 clamp rule, its payload and durability as written, not actionable; a store that keeps to its cap on its own may also drop the oldest non-durable records, never a durable one and never below the cap | label, payload, extra records: VL-1; actionability: VL-2; durability, dropped records: VL-4 |
+| seed_operator | one new record: operator, not actionable, not durable, payload as given; the same cap-keeping allowance as write | dropped records: VL-4; everything else: VL-2 |
+| activate (operator target) | the target's actionability becomes true | VL-2 |
+| activate (any other target) | nothing; the call reports refused | VL-2 |
+| promote in-band | nothing | VL-2 |
+| promote out-of-band | the target's label becomes operator | VL-2 |
+| prune | only non-durable records are removed, down to exactly the store's cap | VL-4 |
+
+After every operation, every record's envelope must carry the boundary kind,
+a warning and the record's current label, and an envelope may change only
+when its record's label does (VL-3). The table is `ALLOWED_DELTAS` and
+`OWNERS` in `verification_ledger.conformance.probes`.
+
+The suite runs one fixed set of scenarios (`SCENARIOS`): legitimate writes of
+every kind; the operator fast path, including activating a record just
+promoted out-of-band; retention to the cap; laundering attacks; an aggressive
+prune; and a forced durable loss. Every violation a scenario finds is credited
+to the invariant that owns it, whichever scenario found it, and each
+invariant is graded on every scenario (positive scenarios as its positive
+probes, adversarial ones as its adversarial probes). A clamped write that comes
+out actionable therefore fails VL-2 even though the scenario that writes it is
+about labels.
 
 The suite runs entirely against this protocol, so it grades the bundled reference
 implementation and any third-party store the same way. The suite is the standard;

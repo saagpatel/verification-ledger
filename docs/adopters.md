@@ -46,7 +46,7 @@ def seed_operator(self, payload: str) -> int:
 ```
 
 Both are legitimate out-of-band paths to an operator record. Because the VL-2
-*adversarial* probes independently prove the in-band path to `operator` stays
+*adversarial* probes independently check that the in-band path to `operator` stays
 closed, letting each adapter declare its own seed here does not weaken the score
 — it only stops the *positive* probe from hard-coding the reference's mechanics.
 
@@ -79,9 +79,23 @@ out-of-band promotion opens the legitimate path, every read carries the
 boundary envelope, and a `LEDGER`-tagged row survives an aggressive prune that
 caps untagged rows at 50 per source.
 
+That result was graded against the first version of the probes. The probes
+have since been tightened (the clamp must land on exactly `agent` and be
+recorded, in-band promotion must leave actionability and every other record
+untouched, out-of-band promotion must touch one exact record, an agent record's
+envelope must say `agent`, a forced durable loss must show up in health with
+a counter, and no write, activation or promotion may create records on the side,
+which the probes check with `count_records()` alongside every record they wrote;
+`StoredRecord` now also carries each record's `payload` and `durable`, and the
+new `record_ids()` lists every record, so the probes can compare the store's
+complete state before and after each operation; an adapter must report all of
+it), and the adapter protocol gained the hooks those checks need
+(`clamp_recorded`, `durable_violations`, `force_durable_loss`, and an unlabeled
+`write`). bridge-db has not been re-graded against them here.
+
 The adapter that drives bridge-db is not shipped in this repository: it imports
 bridge-db's package to reach those tools, and this project depends on no external
 store by design. The point of this note is the *shape* — an adapter is a thin,
-honest translation from these seven-or-so calls to a store's real surface, and a
+honest translation from these dozen-or-so calls to a store's real surface, and a
 store that enforces the invariants through stricter machinery than the reference
 still scores 1.00.

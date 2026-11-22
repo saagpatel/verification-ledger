@@ -29,6 +29,11 @@ class StoredRecord:
     source_trust: str
     actionable: bool
     envelope: dict[str, str] | None
+    # The record's content and durability. The probes compare them wherever an
+    # operation must leave a record unchanged; an adapter that leaves them
+    # unset (None) fails those probes.
+    payload: str | None = None
+    durable: bool | None = None
 
 
 class LedgerAdapter(Protocol):
@@ -39,9 +44,23 @@ class LedgerAdapter(Protocol):
         ...
 
     def write(
-        self, payload: str, *, source_trust: str, channel: str, durable: bool
+        self, payload: str, *, source_trust: str | None, channel: str, durable: bool
     ) -> int:
-        """Store a record and return its id. Must honor the VL-1 in-band operator clamp."""
+        """Store a record and return its id. Must honor the VL-1 in-band operator clamp.
+
+        ``source_trust=None`` means the writer passed no label at all; the store
+        applies its own write default (VL-1 requires ``agent``).
+        """
+        ...
+
+    def clamp_recorded(self, record_id: int) -> bool:
+        """Whether the store recorded a VL-1 clamp for the write that created
+        ``record_id`` (an in-band ``operator`` request it refused to honor).
+
+        The store's own record of the clamp, as it keeps it: a flag on the write
+        result, a column, an audit row. Must be False for a write that was not
+        clamped.
+        """
         ...
 
     def read(self, record_id: int) -> StoredRecord | None:
@@ -88,6 +107,30 @@ class LedgerAdapter(Protocol):
         """Total records currently stored (for VL-4 cap checks)."""
         ...
 
+    def record_ids(self) -> list[int]:
+        """The id of every record currently stored, in any order.
+
+        The probes read every listed id back through ``read()`` before and after
+        each mutating operation, so they compare the store's complete exposed
+        state, not only the records they wrote. Must agree with
+        ``count_records()``.
+        """
+        ...
+
     def health_ok(self) -> bool:
         """Whether the store reports itself healthy (VL-4)."""
+        ...
+
+    def durable_violations(self) -> int:
+        """The store's own VL-4 violation counter: how many durable-record losses
+        (or other durable-integrity violations) its health check currently reports.
+        Zero on a healthy store."""
+        ...
+
+    def force_durable_loss(self, record_id: int) -> None:
+        """Destroy durable record ``record_id`` *behind the store's API*, the way
+        careless housekeeping or a crash would (for a SQL store: a raw ``DELETE``
+        of the row). This is a test hook for the VL-4 detection probe: it must not
+        go through any API path that would refuse or log the deletion, and it must
+        not repair the store's evidence of the record."""
         ...

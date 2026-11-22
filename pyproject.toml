@@ -1,7 +1,7 @@
 [project]
 name = "verification-ledger"
 version = "0.1.0"
-description = "A governed coordination ledger for local multi-agent fleets: provenance typing, a promotion gate, an instruction-boundary envelope, and a retention invariant — with an executable conformance suite that proves them."
+description = "A governed coordination ledger for local multi-agent fleets: provenance typing, a promotion gate, an instruction-boundary envelope, and a retention invariant, with an executable conformance suite that tests them."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
