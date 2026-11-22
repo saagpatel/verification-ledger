@@ -19,10 +19,14 @@ from verification_ledger.model import Channel
 def promote(db_path: str, record_id: int) -> int:
     """Promote one record to operator trust. Returns a process exit code."""
     with Ledger(db_path) as led:
-        if led.read(record_id) is None:
+        # promote() checks existence and updates under one write lock; relying
+        # on it, rather than a separate read first, means a record pruned by
+        # another process in between is reported, not a crash.
+        try:
+            result = led.promote(record_id, channel=Channel.OUT_OF_BAND)
+        except KeyError:
             print(f"no record with id {record_id}")
             return 1
-        result = led.promote(record_id, channel=Channel.OUT_OF_BAND)
         print(
             f"record {record_id}: {result.reason} "
             f"(source_trust now {result.source_trust})"
