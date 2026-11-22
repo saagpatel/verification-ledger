@@ -120,13 +120,17 @@ receipt, and a broken chain (a receipt removed or altered anywhere, including
 the newest one). Health reads all of its inputs in one read transaction, so a
 legitimate write committed concurrently is never reported as a violation.
 
-Stores written before the chain existed are migrated once, when opened: the
-migration runs only on that schema transition (a receipts table with no
-integrity columns), fills a digest and link for every receipt from its
-record's current content, and records the schema version. A store already on
-the chain schema is never migrated again. Missing integrity fields, missing
-metadata or a missing schema version in such a store are reported as chain
-breaks; neither reopening the store nor a later write repairs them.
+Stores written before the chain existed are migrated once, when opened. The
+migration runs only on a genuine pre-chain store: its receipts table has none
+of the integrity columns and its metadata has no schema version. It fills a
+digest and link for every receipt from its record's current content and
+records the schema version. Any other shape is a chain-schema store, intact or
+damaged (some integrity columns missing, a version with columns missing,
+columns without a version, a missing table): startup re-creates missing tables
+and columns empty so the store stays usable, but never writes a digest, link,
+metadata row or schema version, and never reuses the id of a receipted record.
+The damage, like NULL integrity fields or missing metadata, is reported as
+chain breaks; neither reopening the store nor a later write repairs it.
 
 *Scope of detection:* the chain, its metadata and the records live in the same
 store, and the hash has no key. A writer with direct write access who changes
@@ -134,8 +138,9 @@ records, receipts and metadata consistently (recomputing every digest and link
 after the change) leaves a store that verifies. Detecting that needs an anchor
 the writer cannot reach, such as the head hash recorded outside the store; the
 reference ships none. The same holds for a writer who rebuilds the pre-chain
-schema so that the next open migrates the store again: that is a consistent
-rewrite of the evidence too. The migration also trusts the content it finds: an
+schema completely (drops every integrity column and the schema version) so
+that the next open migrates the store again, or who drops every ledger table
+so the store looks new: those are consistent rewrites of the evidence too. The migration also trusts the content it finds: an
 overwrite made before a store was migrated is not detectable afterwards.
 
 ## Conformance scoring

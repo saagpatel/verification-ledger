@@ -17,8 +17,9 @@ chain against the live records and counts four kinds of violation separately:
   or metadata deleted).
 
 Missing integrity fields in a store already on the chain schema are evidence,
-not legacy data: ``relink`` (the migration step) runs only when a store moves
-up from the pre-chain schema, never on a store that already has the columns.
+not legacy data: ``relink`` (the migration step) runs only on a genuine
+pre-chain store, whose receipts table has none of the integrity columns and
+whose metadata has no schema version, never on a store with any of either.
 
 This module is pure (no I/O) so the checks are exhaustively testable; the ledger
 owns the tables and applies it.
