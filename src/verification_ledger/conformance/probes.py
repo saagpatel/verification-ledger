@@ -1,18 +1,30 @@
 """Positive and adversarial probes, per invariant. See SPEC.md § "Conformance scoring".
 
 Positive probes assert the legitimate path still works; adversarial probes assert
-the attack is blocked. An invariant passes only when both hold — which is what
+the attack is blocked. An invariant passes only when both hold, which is what
 makes the score un-gameable: a block-everything store fails the positives, an
 allow-everything store fails the adversarials.
 
-Each probe receives a store on a clean slate (the scorer calls ``fresh()`` first)
-and returns True iff the store behaved correctly for that probe.
+Every probe is built from one rule. Before and after every mutating operation
+(write, seed, activate, promote in-band and out-of-band, prune) the probe takes
+a **full-state snapshot** of the store: every record the store lists, read back
+through ``read()`` exactly as a consumer would get it (label, actionability,
+payload, durability and the whole envelope), plus the record count. It then
+checks the change against :data:`ALLOWED_DELTAS`, one table that says, per
+operation, which fields of which record may change and to what; everything else
+must be identical. Each kind of violation belongs to exactly one invariant
+(:data:`OWNERS`), so a probe for VL-k fails only on VL-k's violations. On top of
+the deltas, every record's envelope must agree with its current label after
+every operation (VL-3), new record or not.
+
+Each probe receives a store on a clean slate (the scorer calls ``fresh()``
+first) and returns True iff the store behaved correctly for that probe.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 
 from verification_ledger.conformance.contract import (
     AGENT,
@@ -21,7 +33,6 @@ from verification_ledger.conformance.contract import (
     OPERATOR,
     OUT_OF_BAND,
     LedgerAdapter,
-    StoredRecord,
 )
 
 BOUNDARY_KIND = "stored_data_not_instructions"
@@ -37,285 +48,418 @@ class Probe:
     check: Callable[[LedgerAdapter], bool]
 
 
+# --- the full-state snapshot ---
+
+# The exposed fields of one record, as a reader gets them.
+FIELDS = ("trust", "actionable", "payload", "durable", "envelope")
+
+
+@dataclass(frozen=True)
+class View:
+    """One record's complete exposed state, read back through ``read()``."""
+
+    trust: str
+    actionable: bool
+    payload: str | None
+    durable: bool | None
+    envelope: tuple[tuple[str, str], ...] | None  # the whole envelope, as read
+
+    def value(self, name: str) -> object:
+        return getattr(self, name)
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    """Every record the store lists, plus whether its listing is consistent."""
+
+    records: Mapping[int, View]
+    consistent: bool  # count_records() agrees with record_ids(), and each id reads
+
+
+def snapshot(a: LedgerAdapter) -> Snapshot:
+    """The store's complete exposed state."""
+    ids = list(a.record_ids())
+    records: dict[int, View] = {}
+    consistent = a.count_records() == len(ids) == len(set(ids))
+    for rid in ids:
+        r = a.read(rid)
+        if r is None:
+            consistent = False
+            continue
+        env = None if r.envelope is None else tuple(sorted(r.envelope.items()))
+        records[rid] = View(r.source_trust, r.actionable, r.payload, r.durable, env)
+    return Snapshot(records, consistent)
+
+
+def envelope_agrees(view: View) -> bool:
+    """VL-3: the envelope is present, has the boundary kind and the record's label."""
+    if view.envelope is None:
+        return False
+    env = dict(view.envelope)
+    return (
+        env.get("kind") == BOUNDARY_KIND
+        and env.get("source_trust") == view.trust
+        and bool(env.get("warning"))
+    )
+
+
+# --- the allowed-delta table: the whole contract in one place ---
+
+
+@dataclass(frozen=True)
+class Allowed:
+    """What one operation may change.
+
+    ``creates``: the number of new records the operation itself returns (its id
+    is the target). ``new_record``: what that record must look like (fields not
+    listed are free). ``target``: the fields of the existing target that may,
+    and must, change, with their required new value. ``removes``: ``"none"``, or
+    ``"prune"`` (non-durable records only, down to the store's cap). Anything
+    not listed here must be identical before and after, on every record.
+    """
+
+    creates: int = 0
+    new_record: Mapping[str, object] = field(default_factory=lambda: {})
+    target: Mapping[str, object] = field(default_factory=lambda: {})
+    removes: str = "none"
+
+
+# The new record of a write is checked against the request instead: its label
+# by the VL-1 clamp rule, its payload and durability as written, never born
+# actionable. Those are filled in per call (see _expected_write).
+ALLOWED_DELTAS: dict[str, Allowed] = {
+    "write": Allowed(creates=1),
+    "seed_operator": Allowed(
+        creates=1,
+        new_record={"trust": OPERATOR, "actionable": False, "durable": False},
+    ),
+    "activate_operator": Allowed(target={"actionable": True}),
+    "activate_refused": Allowed(),
+    "promote_in_band": Allowed(),
+    "promote_out_of_band": Allowed(target={"trust": OPERATOR}),
+    "prune": Allowed(removes="prune"),
+}
+
+# Which invariant owns each kind of violation, per operation. "created" is an
+# extra record; "removed" is a record that disappeared. Every envelope
+# violation, of any operation, is VL-3's.
+_VL2_ALL = {
+    f: "VL-2"
+    for f in ("trust", "actionable", "payload", "durable", "created", "removed")
+}
+_VL4_ALL = {
+    f: "VL-4"
+    for f in ("trust", "actionable", "payload", "durable", "created", "removed")
+}
+OWNERS: dict[str, dict[str, str]] = {
+    "write": {
+        "trust": "VL-1",  # the label, per the clamp rule
+        "payload": "VL-1",
+        "created": "VL-1",  # a write creates exactly its own record
+        "actionable": "VL-2",  # never born actionable
+        "durable": "VL-4",  # the durable tag the retention exemption relies on
+        "removed": "VL-4",  # a write must never drop a record
+        "envelope": "VL-3",
+    },
+    "seed_operator": {**_VL2_ALL, "envelope": "VL-3"},
+    "activate_operator": {**_VL2_ALL, "envelope": "VL-3"},
+    "activate_refused": {**_VL2_ALL, "envelope": "VL-3"},
+    "promote_in_band": {**_VL2_ALL, "envelope": "VL-3"},
+    "promote_out_of_band": {**_VL2_ALL, "envelope": "VL-3"},
+    "prune": {**_VL4_ALL, "envelope": "VL-3"},
+}
+
+
+def _expected_write(
+    trust: str | None, channel: str, payload: str, durable: bool
+) -> dict[str, object]:
+    label = AGENT if trust is None else trust
+    if label == OPERATOR and channel == IN_BAND:
+        label = AGENT  # VL-1: clamped
+    return {"trust": label, "actionable": False, "payload": payload, "durable": durable}
+
+
+def violations(
+    op: str,
+    before: Snapshot,
+    after: Snapshot,
+    *,
+    target: int | None,
+    new_record: Mapping[str, object] | None = None,
+    cap: int = 0,
+) -> set[str]:
+    """The invariants whose part of the contract this one operation broke."""
+    allowed = ALLOWED_DELTAS[op]
+    owner = OWNERS[op]
+    found: set[str] = set()
+    if not (before.consistent and after.consistent):
+        found.update(owner.values())
+    created = set(after.records) - set(before.records)
+    removed = set(before.records) - set(after.records)
+    expected_new: set[int] = (
+        {target} if allowed.creates and target is not None else set()
+    )
+    if created - expected_new or expected_new - created:
+        found.add(owner["created"])
+    if allowed.removes == "prune":
+        non_durable = [i for i, v in before.records.items() if v.durable is not True]
+        survivors = [i for i in non_durable if i in after.records]
+        if any(before.records[i].durable is not False for i in removed) or len(
+            survivors
+        ) != min(cap, len(non_durable)):
+            found.add(owner["removed"])
+    elif removed:
+        found.add(owner["removed"])
+    # The operation's own new record.
+    if expected_new and target is not None and target in after.records:
+        view = after.records[target]
+        rules = {**allowed.new_record, **(new_record or {})}
+        for name, want in rules.items():
+            if view.value(name) != want:
+                found.add(owner[name])
+    # Every record present before and after.
+    for rid in set(before.records) & set(after.records):
+        was, now = before.records[rid], after.records[rid]
+        for name in ("trust", "actionable", "payload", "durable"):
+            want = allowed.target.get(name) if rid == target else None
+            if want is not None:
+                if now.value(name) != want:
+                    found.add(owner[name])
+            elif now.value(name) != was.value(name):
+                found.add(owner[name])
+        if now.trust == was.trust and now.envelope != was.envelope:
+            found.add(owner["envelope"])
+    # VL-3: every record's envelope tells the truth, new or not.
+    if not all(envelope_agrees(v) for v in after.records.values()):
+        found.add(owner["envelope"])
+    return found
+
+
+class _Run:
+    """Applies operations through the adapter, checking each against the table."""
+
+    def __init__(self, a: LedgerAdapter) -> None:
+        self.a = a
+        self.found: set[str] = set()
+
+    def _step(
+        self,
+        op: str,
+        call: Callable[[], object],
+        target: int | None = None,
+        new_record: Mapping[str, object] | None = None,
+    ) -> object:
+        before = snapshot(self.a)
+        result = call()
+        tid = (
+            result
+            if isinstance(result, int)
+            and not isinstance(result, bool)
+            and target is None
+            else target
+        )
+        after = snapshot(self.a)
+        cap = self.a.prune_cap() if op == "prune" else 0
+        self.found |= violations(
+            op, before, after, target=tid, new_record=new_record, cap=cap
+        )
+        return result
+
+    def write(
+        self,
+        payload: str,
+        trust: str | None,
+        channel: str = IN_BAND,
+        durable: bool = False,
+    ) -> int:
+        result = self._step(
+            "write",
+            lambda: self.a.write(
+                payload, source_trust=trust, channel=channel, durable=durable
+            ),
+            new_record=_expected_write(trust, channel, payload, durable),
+        )
+        assert isinstance(result, int)
+        return result
+
+    def seed(self, payload: str) -> int:
+        result = self._step(
+            "seed_operator",
+            lambda: self.a.seed_operator(payload),
+            new_record={"payload": payload},
+        )
+        assert isinstance(result, int)
+        return result
+
+    def activate(self, rid: int) -> bool:
+        """Activate in-band. The gate decides on the target's current label, so
+        the expected outcome is read from the store, not assumed."""
+        view = snapshot(self.a).records.get(rid)
+        operator = view is not None and view.trust == OPERATOR
+        op = "activate_operator" if operator else "activate_refused"
+        result = self._step(
+            op, lambda: self.a.activate(rid, channel=IN_BAND), target=rid
+        )
+        if result is not operator:
+            self.found.add(OWNERS[op]["actionable"])
+        return bool(result)
+
+    def promote(self, rid: int, channel: str) -> bool:
+        op = "promote_out_of_band" if channel == OUT_OF_BAND else "promote_in_band"
+        return bool(
+            self._step(op, lambda: self.a.promote(rid, channel=channel), target=rid)
+        )
+
+    def prune(self) -> None:
+        self._step("prune", self.a.prune)
+
+    def bystanders(self) -> None:
+        # One record of every kind, so "changes nothing else" covers each label.
+        self.write("b-agent", AGENT)
+        self.write("b-ingested", INGESTED, durable=True)
+        self.seed("b-operator")
+
+    def clean(self, invariant: str) -> bool:
+        return invariant not in self.found
+
+
 # --- VL-1: provenance typing ---
 
 
-# Every probe starts on a fresh store and writes every record it later checks,
-# so it knows the complete record set: comparing count_records() alongside the
-# known ids catches any record an operation creates on the side.
+def _vl1_stored(
+    trust: str | None, expect_clamp: bool
+) -> Callable[[LedgerAdapter], bool]:
+    def check(a: LedgerAdapter) -> bool:
+        run = _Run(a)
+        run.bystanders()
+        rid = run.write("x", trust)
+        return run.clean("VL-1") and a.clamp_recorded(rid) is expect_clamp
 
-
-def _single_write(
-    a: LedgerAdapter, trust: str | None
-) -> tuple[int, StoredRecord | None]:
-    rid = a.write("x", source_trust=trust, channel=IN_BAND, durable=False)
-    if a.count_records() != 1:
-        return rid, None  # the write created more than the one record
-    return rid, a.read(rid)
-
-
-def _vl1_pos_agent_stored(a: LedgerAdapter) -> bool:
-    rid, r = _single_write(a, AGENT)
-    return r is not None and r.source_trust == AGENT and not a.clamp_recorded(rid)
-
-
-def _vl1_pos_ingested_stored(a: LedgerAdapter) -> bool:
-    rid, r = _single_write(a, INGESTED)
-    return r is not None and r.source_trust == INGESTED and not a.clamp_recorded(rid)
-
-
-def _vl1_pos_no_label_defaults_to_agent(a: LedgerAdapter) -> bool:
-    # SPEC VL-1: "a record with no label defaults to agent".
-    rid, r = _single_write(a, None)
-    return r is not None and r.source_trust == AGENT and not a.clamp_recorded(rid)
-
-
-def _vl1_adv_in_band_operator_clamped(a: LedgerAdapter) -> bool:
-    # The attack: mint operator trust from the in-band channel. SPEC VL-1 says
-    # it is clamped to exactly ``agent`` and the clamp is recorded; a store that
-    # silently relabels it (to anything), or that clamps it but stores an
-    # operator copy on the side, has not implemented the clamp.
-    rid, r = _single_write(a, OPERATOR)
-    return r is not None and r.source_trust == AGENT and a.clamp_recorded(rid)
+    return check
 
 
 # --- VL-2: promotion gate ---
 
 
 def _vl2_pos_operator_activates(a: LedgerAdapter) -> bool:
-    # An operator record (seeded via the store's own out-of-band ceremony —
-    # whatever that is) activates in one in-band call, and the PERSISTED state
-    # reflects it, not just the return value. Using the adapter's seed_operator
-    # keeps this probe agnostic to how the store mints operator trust.
-    rid = a.seed_operator("directive")
-    before = a.read(rid)
-    activated = a.activate(rid, channel=IN_BAND)
-    r = a.read(rid)
-    # The activated record is still operator trust with its content intact: a
-    # store that demotes or rewrites the record it activates leaves an
-    # actionable non-operator (or altered) record behind.
-    return (
-        activated is True
-        and before is not None
-        and r is not None
-        and r.actionable is True
-        and r.source_trust == OPERATOR
-        and r.payload == before.payload
-        and r.durable == before.durable
-    )
+    # The operator fast path: one in-band call, and the persisted state shows it
+    # (only the target's actionability changes; it stays operator, intact).
+    # seed_operator is the store's own out-of-band ceremony, whatever it is.
+    run = _Run(a)
+    run.bystanders()
+    rid = run.seed("directive")
+    run.activate(rid)
+    return run.clean("VL-2")
 
 
-def _vl2_pos_out_of_band_promotion_makes_operator(a: LedgerAdapter) -> bool:
-    rid = a.write("work", source_trust=AGENT, channel=IN_BAND, durable=False)
-    a.promote(rid, channel=OUT_OF_BAND)
-    r = a.read(rid)
-    return r is not None and r.source_trust == OPERATOR
+def _vl2_pos_out_of_band_promotion(a: LedgerAdapter) -> bool:
+    # The ceremony changes one exact record's label, and nothing else.
+    run = _Run(a)
+    run.bystanders()
+    rid = run.write("work", AGENT)
+    run.promote(rid, OUT_OF_BAND)
+    return run.clean("VL-2")
 
 
-def _in_band_activation_refused(a: LedgerAdapter, trust: str) -> bool:
-    # Check persisted state, not only the return: a store that reports "refused"
-    # while the record is actually actionable is laundering. SPEC VL-2: the
-    # refusal mutates nothing, so the complete record set is compared too.
-    others = _bystanders(a)
-    rid = a.write("work", source_trust=trust, channel=IN_BAND, durable=False)
-    before = _state(a, [*others, rid])
-    activated = a.activate(rid, channel=IN_BAND)
-    r = a.read(rid)
-    return (
-        activated is False
-        and r is not None
-        and r.actionable is False
-        and _state(a, [*others, rid]) == before
-    )
+def _vl2_refused_activation(trust: str) -> Callable[[LedgerAdapter], bool]:
+    def check(a: LedgerAdapter) -> bool:
+        run = _Run(a)
+        run.bystanders()
+        rid = run.write("work", trust)
+        run.activate(rid)
+        return run.clean("VL-2")
+
+    return check
 
 
-def _vl2_adv_agent_not_activatable_in_band(a: LedgerAdapter) -> bool:
-    return _in_band_activation_refused(a, AGENT)
+def _vl2_refused_promotion(trust: str) -> Callable[[LedgerAdapter], bool]:
+    def check(a: LedgerAdapter) -> bool:
+        run = _Run(a)
+        run.bystanders()
+        rid = run.write("work", trust)
+        run.promote(rid, IN_BAND)
+        return run.clean("VL-2")
 
-
-def _vl2_adv_operator_activation_is_exact(a: LedgerAdapter) -> bool:
-    # The fast path must not spill: activating one operator record leaves every
-    # other record, and the record set, exactly as it was.
-    # The target is checked too: only its actionable flag may change.
-    others = _bystanders(a)
-    rid = a.seed_operator("directive")
-    count_before, before = _state(a, [*others, rid])
-    activated = a.activate(rid, channel=IN_BAND)
-    count_after, after = _state(a, [*others, rid])
-    target_before, target_after = before[-1], after[-1]
-    return (
-        activated is True
-        and count_after == count_before
-        and after[:-1] == before[:-1]
-        and target_before is not None
-        and target_after is not None
-        and target_after == replace(target_before, actionable=True)
-    )
+    return check
 
 
 def _vl2_adv_record_not_born_actionable(a: LedgerAdapter) -> bool:
-    # A non-operator record must not be actionable before any activation call — a
-    # store that pre-activates records launders untrusted content while activate()
-    # still politely reports "refused".
-    rid = a.write("work", source_trust=AGENT, channel=IN_BAND, durable=False)
-    r = a.read(rid)
-    return r is not None and r.actionable is False
-
-
-def _state(a: LedgerAdapter, ids: list[int]) -> tuple[int, list[StoredRecord | None]]:
-    """The complete record set as far as the probe can see it: the count, plus
-    every record the probe wrote. On a fresh store those are all the records."""
-    return a.count_records(), [a.read(rid) for rid in ids]
-
-
-def _bystanders(a: LedgerAdapter) -> list[int]:
-    # One record of every kind, so "mutates nothing" covers each label.
-    return [
-        a.write("b-agent", source_trust=AGENT, channel=IN_BAND, durable=False),
-        a.write("b-ingested", source_trust=INGESTED, channel=IN_BAND, durable=True),
-        a.seed_operator("b-operator"),
-    ]
-
-
-def _in_band_promotion_refused(a: LedgerAdapter, trust: str) -> bool:
-    # SPEC VL-2: an in-band promotion attempt is refused and mutates nothing.
-    # Persisted state, not just the label: a store whose in-band promote() makes
-    # the record actionable while leaving it labeled agent is laundering.
-    # The complete record set is compared, so a store that refuses the
-    # promotion but mints a new operator record on the side is caught too.
-    others = _bystanders(a)
-    rid = a.write("work", source_trust=trust, channel=IN_BAND, durable=False)
-    before = _state(a, [*others, rid])
-    a.promote(rid, channel=IN_BAND)
-    r = a.read(rid)
-    return (
-        r is not None
-        and r.source_trust == trust
-        and r.actionable is False
-        and _state(a, [*others, rid]) == before
-    )
-
-
-def _vl2_adv_agent_not_promotable_in_band(a: LedgerAdapter) -> bool:
-    return _in_band_promotion_refused(a, AGENT)
-
-
-def _vl2_adv_ingested_not_promotable_in_band(a: LedgerAdapter) -> bool:
-    return _in_band_promotion_refused(a, INGESTED)
-
-
-def _vl2_adv_out_of_band_promotion_is_exact(a: LedgerAdapter) -> bool:
-    # SPEC VL-2: the ceremony is "applied to one exact record". Promoting the
-    # middle of three records must leave the other two exactly as they were
-    # and must not add a record.
-    ids = [
-        a.write(f"w{i}", source_trust=AGENT, channel=IN_BAND, durable=False)
-        for i in range(3)
-    ]
-    count_before, before = _state(a, ids)
-    a.promote(ids[1], channel=OUT_OF_BAND)
-    count_after, after = _state(a, ids)
-    target, was = after[1], before[1]
-    # Only the target's label changes: not its actionability, content or
-    # durability (activation is a separate, gated transition).
-    return (
-        count_after == count_before
-        and target is not None
-        and was is not None
-        and target.source_trust == OPERATOR
-        and target.actionable == was.actionable
-        and target.payload == was.payload
-        and target.durable == was.durable
-        and after[0] == before[0]
-        and after[2] == before[2]
-    )
-
-
-def _vl2_adv_ingested_not_activatable_in_band(a: LedgerAdapter) -> bool:
-    return _in_band_activation_refused(a, INGESTED)
+    # A record must not be actionable before any activation call: a store that
+    # pre-activates records launders untrusted content while activate() still
+    # politely reports "refused".
+    run = _Run(a)
+    run.bystanders()
+    run.write("work", AGENT)
+    run.write("scraped", INGESTED)
+    return run.clean("VL-2")
 
 
 # --- VL-3: instruction-boundary envelope ---
 
 
-def _vl3_pos_envelope_present(a: LedgerAdapter) -> bool:
-    r = a.read(a.write("x", source_trust=AGENT, channel=IN_BAND, durable=False))
-    return (
-        r is not None
-        and r.envelope is not None
-        and r.envelope.get("kind") == BOUNDARY_KIND
-    )
+def _vl3_pos_legitimate_operations(a: LedgerAdapter) -> bool:
+    # Every envelope agrees with its record's current label after every
+    # legitimate operation, including a record whose label just changed.
+    run = _Run(a)
+    run.bystanders()
+    op_id = run.seed("directive")
+    run.activate(op_id)
+    rid = run.write("work", AGENT)
+    run.promote(rid, OUT_OF_BAND)
+    run.write("kept", AGENT, durable=True)
+    for i in range(a.prune_cap() + 1):
+        run.write(f"n{i}", AGENT)
+    run.prune()
+    return run.clean("VL-3")
 
 
-def _vl3_pos_operator_envelope_says_operator(a: LedgerAdapter) -> bool:
-    # The legitimate path: an operator record's envelope carries its real label.
-    r = a.read(a.seed_operator("directive"))
-    return (
-        r is not None
-        and r.envelope is not None
-        and r.envelope.get("kind") == BOUNDARY_KIND
-        and r.envelope.get("source_trust") == OPERATOR
-    )
-
-
-def _vl3_adv_agent_envelope_says_agent(a: LedgerAdapter) -> bool:
-    # An envelope that labels agent content "operator" launders it at read time
-    # even if the stored label is honest.
-    r = a.read(a.write("x", source_trust=AGENT, channel=IN_BAND, durable=False))
-    return (
-        r is not None
-        and r.envelope is not None
-        and r.envelope.get("source_trust") == AGENT
-    )
-
-
-def _vl3_adv_envelope_reflects_real_trust(a: LedgerAdapter) -> bool:
-    # The envelope must carry the record's real (most-suspicious) trust, not a
-    # laundered, safer-looking label.
-    r = a.read(
-        a.write("scraped", source_trust=INGESTED, channel=IN_BAND, durable=False)
-    )
-    return (
-        r is not None
-        and r.envelope is not None
-        and r.envelope.get("source_trust") == INGESTED
-    )
+def _vl3_adv_attacks(a: LedgerAdapter) -> bool:
+    # The same after every attack: ingested content, an in-band operator mint,
+    # refused activations and refused in-band promotions.
+    run = _Run(a)
+    run.bystanders()
+    for trust in (INGESTED, OPERATOR):
+        run.activate(run.write("refused", trust))
+        run.promote(run.write("in-band", trust), IN_BAND)
+    return run.clean("VL-3")
 
 
 # --- VL-4: retention invariant ---
 
 
-def _vl4_pos_prunes_non_durable_to_cap(a: LedgerAdapter) -> bool:
-    # Overflow the store's own declared cap, then prune. The legitimate outcome:
-    # exactly `cap` non-durable records survive, the one durable record is exempt,
-    # and the store still reports healthy.
-    cap = a.prune_cap()
-    a.write("keep", source_trust=AGENT, channel=IN_BAND, durable=True)
-    for i in range(cap + 3):
-        a.write(f"n{i}", source_trust=AGENT, channel=IN_BAND, durable=False)
-    a.prune()
-    return a.count_records() == cap + 1 and a.health_ok() is True
+def _vl4_prune(durable_first: bool) -> Callable[[LedgerAdapter], bool]:
+    def check(a: LedgerAdapter) -> bool:
+        # Overflow the store's declared cap, then prune: exactly ``cap``
+        # non-durable records survive, every durable one survives unchanged,
+        # and the store still reports healthy.
+        run = _Run(a)
+        cap = a.prune_cap()
+        if durable_first:
+            run.write("keep", AGENT, durable=True)
+        for i in range(cap + 3):
+            run.write(f"n{i}", AGENT)
+        if not durable_first:
+            run.write("shipped", INGESTED, durable=True)
+        run.prune()
+        return (
+            run.clean("VL-4") and a.count_records() == cap + 1 and a.health_ok() is True
+        )
 
-
-def _vl4_adv_durable_survives_aggressive_prune(a: LedgerAdapter) -> bool:
-    # Flood well past the cap so pruning is forced to act, then confirm the durable
-    # record still survives — retention exemption must hold under real pressure.
-    cap = a.prune_cap()
-    rid = a.write("shipped", source_trust=AGENT, channel=IN_BAND, durable=True)
-    for i in range(cap + 3):
-        a.write(f"n{i}", source_trust=AGENT, channel=IN_BAND, durable=False)
-    a.prune()
-    r = a.read(rid)  # the durable record must remain, still durable and intact
-    return r is not None and r.durable is True and r.payload == "shipped"
+    return check
 
 
 def _vl4_adv_durable_loss_is_reported(a: LedgerAdapter) -> bool:
     # SPEC VL-4: "a forced orphan or durable loss is reported by health with a
     # non-zero counter". Healthy first, then destroy the durable record behind
     # the API and require health to notice, with a counter.
-    rid = a.write("shipped", source_trust=AGENT, channel=IN_BAND, durable=True)
-    a.write("n", source_trust=AGENT, channel=IN_BAND, durable=False)
-    if a.health_ok() is not True or a.durable_violations() != 0:
+    run = _Run(a)
+    rid = run.write("shipped", AGENT, durable=True)
+    run.write("n", AGENT)
+    if (
+        not run.clean("VL-4")
+        or a.health_ok() is not True
+        or a.durable_violations() != 0
+    ):
         return False
     a.force_durable_loss(rid)
     return a.health_ok() is False and a.durable_violations() > 0
@@ -324,21 +468,21 @@ def _vl4_adv_durable_loss_is_reported(a: LedgerAdapter) -> bool:
 def all_probes() -> list[Probe]:
     """Every probe, tagged by invariant and kind."""
     return [
-        Probe("VL-1", "positive", "agent stored as agent", _vl1_pos_agent_stored),
-        Probe(
-            "VL-1", "positive", "ingested stored as ingested", _vl1_pos_ingested_stored
-        ),
+        Probe("VL-1", "positive", "agent stored as agent", _vl1_stored(AGENT, False)),
         Probe(
             "VL-1",
             "positive",
-            "no label defaults to agent",
-            _vl1_pos_no_label_defaults_to_agent,
+            "ingested stored as ingested",
+            _vl1_stored(INGESTED, False),
+        ),
+        Probe(
+            "VL-1", "positive", "no label defaults to agent", _vl1_stored(None, False)
         ),
         Probe(
             "VL-1",
             "adversarial",
             "in-band operator clamped to agent and recorded",
-            _vl1_adv_in_band_operator_clamped,
+            _vl1_stored(OPERATOR, True),
         ),
         Probe(
             "VL-2",
@@ -349,14 +493,32 @@ def all_probes() -> list[Probe]:
         Probe(
             "VL-2",
             "positive",
-            "out-of-band promotion mints operator",
-            _vl2_pos_out_of_band_promotion_makes_operator,
+            "out-of-band promotion changes one label",
+            _vl2_pos_out_of_band_promotion,
         ),
         Probe(
             "VL-2",
             "adversarial",
             "agent not activatable in-band",
-            _vl2_adv_agent_not_activatable_in_band,
+            _vl2_refused_activation(AGENT),
+        ),
+        Probe(
+            "VL-2",
+            "adversarial",
+            "ingested not activatable in-band",
+            _vl2_refused_activation(INGESTED),
+        ),
+        Probe(
+            "VL-2",
+            "adversarial",
+            "agent not promotable in-band",
+            _vl2_refused_promotion(AGENT),
+        ),
+        Probe(
+            "VL-2",
+            "adversarial",
+            "ingested not promotable in-band",
+            _vl2_refused_promotion(INGESTED),
         ),
         Probe(
             "VL-2",
@@ -365,67 +527,28 @@ def all_probes() -> list[Probe]:
             _vl2_adv_record_not_born_actionable,
         ),
         Probe(
-            "VL-2",
-            "adversarial",
-            "agent not promotable in-band",
-            _vl2_adv_agent_not_promotable_in_band,
-        ),
-        Probe(
-            "VL-2",
-            "adversarial",
-            "ingested not activatable in-band",
-            _vl2_adv_ingested_not_activatable_in_band,
-        ),
-        Probe(
-            "VL-2",
-            "adversarial",
-            "ingested not promotable in-band",
-            _vl2_adv_ingested_not_promotable_in_band,
-        ),
-        Probe(
-            "VL-2",
-            "adversarial",
-            "out-of-band promotion touches one exact record",
-            _vl2_adv_out_of_band_promotion_is_exact,
-        ),
-        Probe(
-            "VL-2",
-            "adversarial",
-            "operator activation touches one exact record",
-            _vl2_adv_operator_activation_is_exact,
-        ),
-        Probe(
-            "VL-3", "positive", "read carries the envelope", _vl3_pos_envelope_present
-        ),
-        Probe(
             "VL-3",
             "positive",
-            "operator envelope says operator",
-            _vl3_pos_operator_envelope_says_operator,
+            "envelopes stay true through legitimate operations",
+            _vl3_pos_legitimate_operations,
         ),
         Probe(
             "VL-3",
             "adversarial",
-            "envelope reflects real trust",
-            _vl3_adv_envelope_reflects_real_trust,
-        ),
-        Probe(
-            "VL-3",
-            "adversarial",
-            "agent envelope says agent",
-            _vl3_adv_agent_envelope_says_agent,
+            "envelopes stay true through attacks",
+            _vl3_adv_attacks,
         ),
         Probe(
             "VL-4",
             "positive",
             "non-durable pruned to cap",
-            _vl4_pos_prunes_non_durable_to_cap,
+            _vl4_prune(durable_first=True),
         ),
         Probe(
             "VL-4",
             "adversarial",
             "durable survives aggressive prune",
-            _vl4_adv_durable_survives_aggressive_prune,
+            _vl4_prune(durable_first=False),
         ),
         Probe(
             "VL-4",

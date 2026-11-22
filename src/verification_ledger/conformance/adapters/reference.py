@@ -96,6 +96,9 @@ class ReferenceAdapter:
     def count_records(self) -> int:
         return len(self._led.read_all())
 
+    def record_ids(self) -> list[int]:
+        return [e.record.id for e in self._led.read_all()]
+
     def health_ok(self) -> bool:
         return self._led.health().ok
 

@@ -105,6 +105,9 @@ class _DoubleBase:
     def count_records(self) -> int:
         return len(self._rows)
 
+    def record_ids(self) -> list[int]:
+        return list(self._rows)
+
     def durable_violations(self) -> int:
         return sum(
             1

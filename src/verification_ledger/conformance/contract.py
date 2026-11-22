@@ -107,6 +107,16 @@ class LedgerAdapter(Protocol):
         """Total records currently stored (for VL-4 cap checks)."""
         ...
 
+    def record_ids(self) -> list[int]:
+        """The id of every record currently stored, in any order.
+
+        The probes read every listed id back through ``read()`` before and after
+        each mutating operation, so they compare the store's complete exposed
+        state, not only the records they wrote. Must agree with
+        ``count_records()``.
+        """
+        ...
+
     def health_ok(self) -> bool:
         """Whether the store reports itself healthy (VL-4)."""
         ...

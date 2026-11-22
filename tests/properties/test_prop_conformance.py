@@ -199,6 +199,9 @@ class PolicyStore:
     def count_records(self) -> int:
         return len(self.rows)
 
+    def record_ids(self) -> list[int]:
+        return list(self.rows)
+
     def durable_violations(self) -> int:
         if self.policy.health == "always_ok":
             return 0
@@ -251,123 +254,264 @@ policies = st.builds(
 
 
 # --- the oracle: each invariant's SPEC.md pass condition, checked directly ---
+#
+# Written independently of probes.py (nothing below is imported from it): its
+# own copy of the allowed-delta contract, and a model-based check instead of
+# the probes' snapshot diff. After every operation the oracle predicts the
+# store's complete exposed state from SPEC.md and compares every field of
+# every record, then adopts what it observed so each operation is judged on
+# its own change.
+
+_ORACLE_FIELDS = ("trust", "actionable", "payload", "durable")
+
+# Per operation: which invariant a violation of each kind belongs to. Mirrors
+# SPEC.md: labels at write time are VL-1, actionability and everything the
+# gate's operations touch are VL-2, durability and record loss are VL-4, the
+# envelope is always VL-3.
+_ORACLE_OWNER: dict[str, dict[str, str]] = {
+    "write": {
+        "trust": "VL-1",
+        "payload": "VL-1",
+        "extra": "VL-1",
+        "actionable": "VL-2",
+        "durable": "VL-4",
+        "lost": "VL-4",
+    },
+    **{
+        op: {
+            k: "VL-2"
+            for k in ("trust", "payload", "extra", "actionable", "durable", "lost")
+        }
+        for op in ("seed", "activate", "refuse", "promote", "promote_in_band")
+    },
+    "prune": {
+        k: "VL-4"
+        for k in ("trust", "payload", "extra", "actionable", "durable", "lost")
+    },
+}
 
 
-def _snap(a: PolicyStore) -> dict[int, tuple[str, bool, bool, str]]:
-    return a.snapshot()
-
-
-def spec_vl1(a: PolicyStore) -> bool:
-    """SPEC VL-1: no label means agent; in-band operator reads back as agent with
-    a recorded clamp; agent and ingested are stored unchanged and unclamped."""
-    for trust in (None, *TRUSTS):
-        for channel in CHANNELS:
-            a.fresh()
-            rid = a.write("x", source_trust=trust, channel=channel, durable=False)
-            if set(a.snapshot()) != {rid}:
-                return False  # a write must create exactly its own record
-            r = a.read(rid)
-            clamp = trust == c.OPERATOR and channel == c.IN_BAND
-            expected = c.AGENT if (trust is None or clamp) else trust
-            if r is None or r.source_trust != expected:
-                return False
-            if a.clamp_recorded(rid) is not clamp:
-                return False
-    return True
-
-
-def spec_vl2(a: PolicyStore) -> bool:
-    """SPEC VL-2: refusals mutate nothing; ceremony promotes one exact record; fast path open."""
-    for trust in (c.AGENT, c.INGESTED):
-        for attempt in ("activate", "promote"):
-            a.fresh()
-            for other in TRUSTS:  # bystanders of every kind
-                a.write("b", source_trust=other, channel=c.OUT_OF_BAND, durable=False)
-            rid = a.write("w", source_trust=trust, channel=c.IN_BAND, durable=False)
-            born = a.read(rid)
-            if born is None or born.actionable:
-                return False
-            before = _snap(a)
-            if attempt == "activate":
-                if a.activate(rid, channel=c.IN_BAND) is not False:
-                    return False
-            else:
-                a.promote(rid, channel=c.IN_BAND)
-            if _snap(a) != before:
-                return False
-    a.fresh()
-    ids = [
-        a.write(f"w{i}", source_trust=c.AGENT, channel=c.IN_BAND, durable=False)
-        for i in range(3)
-    ]
-    before = _snap(a)
-    a.promote(ids[1], channel=c.OUT_OF_BAND)
-    after = _snap(a)
-    # Only the target's label changes.
-    t = before[ids[1]]
-    if set(after) != set(before) or after[ids[1]] != (c.OPERATOR, t[1], t[2], t[3]):
-        return False
-    if any(after[i] != before[i] for i in before if i != ids[1]):
-        return False
-    a.fresh()
-    for other in TRUSTS:
-        a.write("b", source_trust=other, channel=c.OUT_OF_BAND, durable=False)
-    rid = a.seed_operator("directive")
-    before = _snap(a)
-    if a.activate(rid, channel=c.IN_BAND) is not True:
-        return False
-    after = _snap(a)
-    # The target stays operator with its content intact; only actionable changes.
-    t = before[rid]
-    if set(after) != set(before) or after[rid] != (c.OPERATOR, True, t[2], t[3]):
-        return False
-    return all(after[i] == before[i] for i in before if i != rid)
-
-
-def spec_vl3(a: PolicyStore) -> bool:
-    """SPEC VL-3: every read carries the envelope with the record's actual trust."""
-    a.fresh()
-    ids = [
-        a.write("x", source_trust=t, channel=c.IN_BAND, durable=False)
-        for t in (c.AGENT, c.INGESTED)
-    ]
-    ids.append(a.seed_operator("op"))
+def _observe(a: LedgerAdapter) -> dict[int, StoredRecord] | None:
+    ids = a.record_ids()
+    if a.count_records() != len(ids):
+        return None
+    out: dict[int, StoredRecord] = {}
     for rid in ids:
         r = a.read(rid)
-        if r is None or r.envelope is None:
-            return False
-        if (
-            r.envelope.get("kind") != BOUNDARY_KIND
-            or r.envelope.get("source_trust") != r.source_trust
-        ):
-            return False
-    return True
+        if r is None:
+            return None
+        out[rid] = r
+    return out
 
 
-def spec_vl4(a: PolicyStore) -> bool:
-    """SPEC VL-4: prune keeps every durable and the newest ``cap`` non-durable; loss is reported."""
-    a.fresh()
-    durable = [
-        a.write(f"d{i}", source_trust=c.AGENT, channel=c.IN_BAND, durable=True)
-        for i in range(2)
-    ]
-    plain = [
-        a.write(f"n{i}", source_trust=c.AGENT, channel=c.IN_BAND, durable=False)
-        for i in range(CAP + 3)
-    ]
-    a.prune()
-    snap = a.snapshot()
-    if set(snap) != set(durable) | set(plain[-CAP:]) or not a.health_ok():
-        return False
-    if any(
-        snap[d][2] is not True or snap[d][3] != f"d{i}" for i, d in enumerate(durable)
-    ):
-        return False  # a surviving durable record must stay durable and intact
-    a.force_lose(durable[0])
-    return a.health_ok() is False and a.durable_violations() > 0
+def _true_envelope(r: StoredRecord) -> bool:
+    env = r.envelope
+    return (
+        env is not None
+        and env.get("kind") == BOUNDARY_KIND
+        and env.get("source_trust") == r.source_trust
+        and bool(env.get("warning"))
+    )
 
 
-SPEC: dict[str, Callable[[PolicyStore], bool]] = {
+class _Oracle:
+    """Runs a scenario against a store and collects which invariants it broke."""
+
+    def __init__(self, a: LedgerAdapter) -> None:
+        self.a = a
+        a.fresh()
+        self.state: dict[int, StoredRecord] = {}
+        self.broken: set[str] = set()
+
+    def _judge(
+        self,
+        op: str,
+        predicted: dict[int, dict[str, object]],
+        *,
+        prune_cap: int | None = None,
+    ) -> None:
+        owner = _ORACLE_OWNER[op]
+        seen = _observe(self.a)
+        if seen is None:
+            self.broken.update(owner.values())
+            self.broken.add("VL-3")
+            return
+        extra = set(seen) - set(predicted)
+        gone = set(predicted) - set(seen)
+        if extra:
+            self.broken.add(owner["extra"])
+        if prune_cap is not None:
+            plain = [i for i in predicted if predicted[i]["durable"] is False]
+            kept = [i for i in plain if i in seen]
+            if (gone - set(plain)) or len(kept) != min(prune_cap, len(plain)):
+                self.broken.add(owner["lost"])
+        elif gone:
+            self.broken.add(owner["lost"])
+        for rid in set(seen) & set(predicted):
+            r = seen[rid]
+            actual = {
+                "trust": r.source_trust,
+                "actionable": r.actionable,
+                "payload": r.payload,
+                "durable": r.durable,
+            }
+            for name in _ORACLE_FIELDS:
+                if actual[name] != predicted[rid][name]:
+                    self.broken.add(owner[name])
+            old = self.state.get(rid)
+            if (
+                old is not None
+                and old.source_trust == r.source_trust
+                and old.envelope != r.envelope
+            ):
+                self.broken.add("VL-3")
+        if not all(_true_envelope(r) for r in seen.values()):
+            self.broken.add("VL-3")
+        self.state = seen
+
+    def _now(self) -> dict[int, dict[str, object]]:
+        return {
+            rid: {
+                "trust": r.source_trust,
+                "actionable": r.actionable,
+                "payload": r.payload,
+                "durable": r.durable,
+            }
+            for rid, r in self.state.items()
+        }
+
+    def write(self, payload: str, trust: str | None, durable: bool = False) -> int:
+        rid = self.a.write(
+            payload, source_trust=trust, channel=c.IN_BAND, durable=durable
+        )
+        label = c.AGENT if trust in (None, c.OPERATOR) else trust
+        predicted = self._now()
+        predicted[rid] = {
+            "trust": label,
+            "actionable": False,
+            "payload": payload,
+            "durable": durable,
+        }
+        self._judge("write", predicted)
+        if self.a.clamp_recorded(rid) is not (trust == c.OPERATOR):
+            self.broken.add("VL-1")
+        return rid
+
+    def seed(self, payload: str) -> int:
+        rid = self.a.seed_operator(payload)
+        predicted = self._now()
+        predicted[rid] = {
+            "trust": c.OPERATOR,
+            "actionable": False,
+            "payload": payload,
+            "durable": False,
+        }
+        self._judge("seed", predicted)
+        return rid
+
+    def activate(self, rid: int) -> None:
+        if rid not in self.state:
+            return  # already reported as lost
+        operator = self.state[rid].source_trust == c.OPERATOR
+        result = self.a.activate(rid, channel=c.IN_BAND)
+        predicted = self._now()
+        if operator:
+            predicted[rid] = {**predicted[rid], "actionable": True}
+        if result is not operator:
+            self.broken.add("VL-2")
+        self._judge("activate" if operator else "refuse", predicted)
+
+    def promote(self, rid: int, channel: str) -> None:
+        if rid not in self.state:
+            return  # already reported as lost
+        self.a.promote(rid, channel=channel)
+        predicted = self._now()
+        if channel == c.OUT_OF_BAND:
+            predicted[rid] = {**predicted[rid], "trust": c.OPERATOR}
+            self._judge("promote", predicted)
+        else:
+            self._judge("promote_in_band", predicted)
+
+    def prune(self) -> None:
+        self.a.prune()
+        self._judge("prune", self._now(), prune_cap=self.a.prune_cap())
+
+    def others(self) -> None:
+        self.write("o-agent", c.AGENT)
+        self.write("o-ingested", c.INGESTED, durable=True)
+        self.seed("o-operator")
+
+
+def _oracle_gate_and_labels(a: LedgerAdapter) -> set[str]:
+    o = _Oracle(a)
+    o.others()
+    for trust in (c.AGENT, c.INGESTED, None, c.OPERATOR):
+        o.write(f"w-{trust}", trust)
+    o.activate(o.seed("directive"))
+    for trust in (c.AGENT, c.INGESTED):
+        o.activate(o.write("refused", trust))
+        o.promote(o.write("in-band", trust), c.IN_BAND)
+    target = o.write("ceremony", c.AGENT)
+    o.promote(target, c.OUT_OF_BAND)
+    o.activate(target)  # now operator: the fast path
+    return o.broken
+
+
+def _oracle_retention(a: LedgerAdapter) -> set[str]:
+    o = _Oracle(a)
+    cap = a.prune_cap()
+    o.write("kept", c.AGENT, durable=True)
+    for i in range(cap + 3):
+        o.write(f"n{i}", c.AGENT)
+    o.write("shipped", c.INGESTED, durable=True)
+    o.prune()
+    broken = set(o.broken)
+    if a.count_records() != cap + 2 or a.health_ok() is not True:
+        broken.add("VL-4")
+    # Loss detection, on a clean store.
+    o = _Oracle(a)
+    rid = o.write("lost", c.AGENT, durable=True)
+    if a.health_ok() is not True or a.durable_violations() != 0:
+        broken.add("VL-4")
+    a.force_durable_loss(rid)
+    if a.health_ok() is not False or a.durable_violations() <= 0:
+        broken.add("VL-4")
+    return broken | o.broken
+
+
+def _oracle_envelopes(a: LedgerAdapter) -> set[str]:
+    o = _Oracle(a)
+    o.others()
+    o.activate(o.seed("directive"))
+    for trust in (c.INGESTED, c.OPERATOR):
+        o.activate(o.write("refused", trust))
+        o.promote(o.write("in-band", trust), c.IN_BAND)
+    rid = o.write("ceremony", c.AGENT)
+    o.promote(rid, c.OUT_OF_BAND)
+    o.write("kept", c.AGENT, durable=True)
+    for i in range(a.prune_cap() + 1):
+        o.write(f"n{i}", c.AGENT)
+    o.prune()
+    return {"VL-3"} & o.broken
+
+
+def spec_vl1(a: LedgerAdapter) -> bool:
+    return "VL-1" not in _oracle_gate_and_labels(a)
+
+
+def spec_vl2(a: LedgerAdapter) -> bool:
+    return "VL-2" not in _oracle_gate_and_labels(a)
+
+
+def spec_vl3(a: LedgerAdapter) -> bool:
+    return not _oracle_envelopes(a)
+
+
+def spec_vl4(a: LedgerAdapter) -> bool:
+    return "VL-4" not in _oracle_retention(a)
+
+
+SPEC: dict[str, Callable[[LedgerAdapter], bool]] = {
     "VL-1": spec_vl1,
     "VL-2": spec_vl2,
     "VL-3": spec_vl3,
@@ -831,3 +975,218 @@ def test_every_probed_state_change_fails_exactly_its_invariant(
     failed = {s.invariant for s in score_adapter(store).invariants if not s.passed}
     assert failed == {invariant}
     assert not SPEC[invariant](store_type(HONEST))
+
+
+# --- generated mutations: every operation, every field, every record ---
+#
+# Instead of hand-picking broken stores, generate one per (operation, record,
+# field): an otherwise honest store whose operation also changes that one
+# field of that one record in a way the allowed-delta contract forbids, or
+# creates or drops a record. Each must fail exactly the invariant that owns
+# that violation (taken from the oracle's own table, not from probes.py), and
+# the oracle must agree. This covers the two round-3 Codex cases by
+# construction: prune changing a surviving record's label, and an envelope
+# left stale after promotion.
+
+MUTATED_OPS = (
+    "write",
+    "seed_operator",
+    "activate_operator",
+    "activate_refused",
+    "promote_in_band",
+    "promote_out_of_band",
+    "prune",
+)
+MUTATED_FIELDS = ("trust", "actionable", "payload", "durable", "envelope")
+_ORACLE_OP = {
+    "write": "write",
+    "seed_operator": "seed",
+    "activate_operator": "activate",
+    "activate_refused": "refuse",
+    "promote_in_band": "promote_in_band",
+    "promote_out_of_band": "promote",
+    "prune": "prune",
+}
+_OTHER_TRUST = {c.OPERATOR: c.AGENT, c.AGENT: c.OPERATOR, c.INGESTED: c.OPERATOR}
+
+
+@dataclass(frozen=True)
+class Mutation:
+    op: str
+    scope: str  # "target" | "other" | "store"
+    field: str  # one of MUTATED_FIELDS, or "created" | "removed"
+
+    @property
+    def owner(self) -> str:
+        if self.field == "envelope":
+            return "VL-3"
+        key = {"created": "extra", "removed": "lost"}.get(self.field, self.field)
+        return _ORACLE_OWNER[_ORACLE_OP[self.op]][key]
+
+    def __str__(self) -> str:
+        return f"{self.op}:{self.scope}:{self.field}"
+
+
+MUTATIONS: list[Mutation] = [
+    *(
+        Mutation(op, scope, f)
+        for op in MUTATED_OPS
+        for scope in ("target", "other")
+        for f in MUTATED_FIELDS
+    ),
+    *(Mutation(op, "store", "created") for op in MUTATED_OPS),
+    *(Mutation(op, "other", "removed") for op in MUTATED_OPS),
+    *(
+        Mutation(op, "target", "removed")
+        for op in MUTATED_OPS
+        if op
+        not in (
+            "write",
+            "seed_operator",
+        )  # a write that stores nothing is not a one-field change
+    ),
+]
+
+
+class MutantStore:
+    """An honest PolicyStore whose one operation also applies one forbidden change."""
+
+    def __init__(self, mutation: Mutation) -> None:
+        self.m = mutation
+        self.inner = PolicyStore(HONEST)
+        self.stale: dict[int, str] = {}  # envelope labels left wrong on purpose
+
+    def _mutate(self, op: str, target: int, other: int | None = None) -> None:
+        if op != self.m.op:
+            return
+        rows = self.inner.rows
+        if other is None:
+            others = sorted(i for i in rows if i != target)
+            other = others[0] if others else None
+        if self.m.field == "created":
+            self.inner._insert(c.AGENT, False, "side")  # pyright: ignore[reportPrivateUsage]
+            return
+        rid = target if self.m.scope == "target" else other
+        if rid is None or rid not in rows:
+            return
+        row = rows[rid]
+        f = self.m.field
+        if f == "removed":
+            del rows[rid]
+        elif f == "trust":
+            row.trust = _OTHER_TRUST[row.trust]
+        elif f == "actionable":
+            row.actionable = not row.actionable
+        elif f == "payload":
+            row.payload += "~"
+        elif f == "durable":
+            row.durable = not row.durable
+        else:
+            self.stale[rid] = c.OPERATOR if row.trust != c.OPERATOR else c.AGENT
+
+    # --- the adapter surface ---
+
+    def fresh(self) -> None:
+        self.inner.fresh()
+        self.stale = {}
+
+    def write(
+        self, payload: str, *, source_trust: str | None, channel: str, durable: bool
+    ) -> int:
+        rid = self.inner.write(
+            payload, source_trust=source_trust, channel=channel, durable=durable
+        )
+        self._mutate("write", rid)
+        return rid
+
+    def seed_operator(self, payload: str) -> int:
+        rid = self.inner.seed_operator(payload)
+        self._mutate("seed_operator", rid)
+        return rid
+
+    def activate(self, record_id: int, *, channel: str) -> bool:
+        op = (
+            "activate_operator"
+            if self.inner.rows[record_id].trust == c.OPERATOR
+            else "activate_refused"
+        )
+        result = self.inner.activate(record_id, channel=channel)
+        self._mutate(op, record_id)
+        return result
+
+    def promote(self, record_id: int, *, channel: str) -> bool:
+        result = self.inner.promote(record_id, channel=channel)
+        self._mutate(
+            "promote_out_of_band" if channel == c.OUT_OF_BAND else "promote_in_band",
+            record_id,
+        )
+        return result
+
+    def prune(self) -> None:
+        self.inner.prune()
+        survivors = sorted(self.inner.rows)
+        if survivors:
+            self._mutate(
+                "prune", survivors[0], survivors[-1] if len(survivors) > 1 else None
+            )
+
+    def read(self, record_id: int) -> StoredRecord | None:
+        r = self.inner.read(record_id)
+        if r is None or r.envelope is None or record_id not in self.stale:
+            return r
+        return replace(
+            r, envelope={**r.envelope, "source_trust": self.stale[record_id]}
+        )
+
+    def clamp_recorded(self, record_id: int) -> bool:
+        return self.inner.clamp_recorded(record_id)
+
+    def prune_cap(self) -> int:
+        return self.inner.prune_cap()
+
+    def count_records(self) -> int:
+        return self.inner.count_records()
+
+    def record_ids(self) -> list[int]:
+        return self.inner.record_ids()
+
+    def health_ok(self) -> bool:
+        return self.inner.health_ok()
+
+    def durable_violations(self) -> int:
+        return self.inner.durable_violations()
+
+    def force_durable_loss(self, record_id: int) -> None:
+        self.inner.force_durable_loss(record_id)
+
+
+def test_mutation_family_size() -> None:
+    # 7 operations x 2 records x 5 fields, plus a side record per operation,
+    # plus a dropped non-target per operation and a dropped target for the 5
+    # operations that have an existing target.
+    assert len(MUTATIONS) == 7 * 2 * 5 + 7 + 7 + 5 == 89
+    assert len({str(m) for m in MUTATIONS}) == len(MUTATIONS)
+
+
+@pytest.mark.parametrize("mutation", MUTATIONS, ids=str)
+def test_generated_mutation_fails_exactly_its_invariant(mutation: Mutation) -> None:
+    report = score_adapter(MutantStore(mutation))
+    failed = {s.invariant for s in report.invariants if not s.passed}
+    assert failed == {mutation.owner}
+    truth = {inv: check(MutantStore(mutation)) for inv, check in SPEC.items()}
+    assert {inv for inv, ok in truth.items() if not ok} == {mutation.owner}
+
+
+def test_round_3_codex_cases_are_in_the_generated_family() -> None:
+    # Prune upgrading a surviving durable record's label to operator, and an
+    # envelope left stale (still "agent") after an out-of-band promotion.
+    names = {str(m) for m in MUTATIONS}
+    assert "prune:target:trust" in names
+    assert "promote_out_of_band:target:envelope" in names
+    for case, owner in (
+        ("prune:target:trust", "VL-4"),
+        ("promote_out_of_band:target:envelope", "VL-3"),
+    ):
+        m = next(m for m in MUTATIONS if str(m) == case)
+        assert m.owner == owner
+        assert not score_adapter(MutantStore(m)).perfect
