@@ -214,8 +214,8 @@ not allow must be identical, on every record:
 
 | Operation | Allowed change | Owner of a violation |
 |---|---|---|
-| write | one new record: its label by the VL-1 clamp rule, its payload and durability as written, not actionable | label, payload, extra records: VL-1; actionability: VL-2; durability, dropped records: VL-4 |
-| seed_operator | one new record: operator, not actionable, not durable, payload as given | VL-2 |
+| write | one new record: its label by the VL-1 clamp rule, its payload and durability as written, not actionable; a store that keeps to its cap on its own may also drop the oldest non-durable records, never a durable one and never below the cap | label, payload, extra records: VL-1; actionability: VL-2; durability, dropped records: VL-4 |
+| seed_operator | one new record: operator, not actionable, not durable, payload as given; the same cap-keeping allowance as write | dropped records: VL-4; everything else: VL-2 |
 | activate (operator target) | the target's actionability becomes true | VL-2 |
 | activate (any other target) | nothing; the call reports refused | VL-2 |
 | promote in-band | nothing | VL-2 |
@@ -226,6 +226,16 @@ After every operation, every record's envelope must carry the boundary kind,
 a warning and the record's current label, and an envelope may change only
 when its record's label does (VL-3). The table is `ALLOWED_DELTAS` and
 `OWNERS` in `verification_ledger.conformance.probes`.
+
+The suite runs one fixed set of scenarios (`SCENARIOS`): legitimate writes of
+every kind; the operator fast path, including activating a record just
+promoted out-of-band; retention to the cap; laundering attacks; an aggressive
+prune; and a forced durable loss. Every violation a scenario finds is credited
+to the invariant that owns it, whichever scenario found it, and each
+invariant is graded on every scenario (positive scenarios as its positive
+probes, adversarial ones as its adversarial probes). A clamped write that comes
+out actionable therefore fails VL-2 even though the scenario that writes it is
+about labels.
 
 The suite runs entirely against this protocol, so it grades the bundled reference
 implementation and any third-party store the same way. The suite is the standard;

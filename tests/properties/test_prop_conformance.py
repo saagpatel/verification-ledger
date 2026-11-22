@@ -30,7 +30,13 @@ from hypothesis import strategies as st
 from verification_ledger.conformance import contract as c
 from verification_ledger.conformance.adapters.reference import ReferenceAdapter
 from verification_ledger.conformance.contract import LedgerAdapter, StoredRecord
-from verification_ledger.conformance.probes import BOUNDARY_KIND, Probe, all_probes
+from verification_ledger.conformance.probes import (
+    BOUNDARY_KIND,
+    SCENARIOS,
+    Probe,
+    Scenario,
+    all_probes,
+)
 from verification_ledger.conformance.score import INVARIANTS, score_adapter
 
 CAP = 3
@@ -60,6 +66,9 @@ class Policy:
     envelope: EnvelopeMode = "honest"
     prune: PruneMode = "correct"
     health: HealthMode = "honest"
+    # Keep to the cap on every write and seed (oldest non-durable first), as the
+    # adapter contract allows; still an honest store.
+    auto_prune: bool = False
 
 
 HONEST = Policy()
@@ -107,7 +116,14 @@ class PolicyStore:
             self.clamped.add(rid)
             if self.policy.clamp == "agent_plus_shadow":
                 self._insert(c.OPERATOR, False, payload)  # an operator copy on the side
+        if self.policy.auto_prune:
+            self._keep_to_cap()
         return rid
+
+    def _keep_to_cap(self) -> None:
+        plain = sorted(i for i, r in self.rows.items() if not r.durable)
+        for i in plain[: max(0, len(plain) - CAP)]:
+            del self.rows[i]
 
     def _insert(self, trust: str, durable: bool, payload: str = "side") -> int:
         rid = self.next_id
@@ -250,14 +266,16 @@ policies = st.builds(
     ),
     prune=st.sampled_from(["correct", "drop_durable", "noop"]),
     health=st.sampled_from(["honest", "always_ok"]),
+    auto_prune=st.booleans(),
 )
 
 
 # --- the oracle: each invariant's SPEC.md pass condition, checked directly ---
 #
-# Written independently of probes.py (nothing below is imported from it): its
-# own copy of the allowed-delta contract, and a model-based check instead of
-# the probes' snapshot diff. After every operation the oracle predicts the
+# Written independently of probes.py: its own copy of the allowed-delta
+# contract, and a model-based check instead of the probes' snapshot diff. Only
+# the scenario list (SCENARIOS) is shared, so the suite and the oracle exercise
+# the same operations and the suite can never look at less than the oracle. After every operation the oracle predicts the
 # store's complete exposed state from SPEC.md and compares every field of
 # every record, then adopts what it observed so each operation is judged on
 # its own change.
@@ -283,6 +301,11 @@ _ORACLE_OWNER: dict[str, dict[str, str]] = {
             for k in ("trust", "payload", "extra", "actionable", "durable", "lost")
         }
         for op in ("seed", "activate", "refuse", "promote", "promote_in_band")
+    },
+    # A seed that drops a record breaks retention.
+    "seed": {
+        **{k: "VL-2" for k in ("trust", "payload", "extra", "actionable", "durable")},
+        "lost": "VL-4",
     },
     "prune": {
         k: "VL-4"
@@ -329,6 +352,7 @@ class _Oracle:
         predicted: dict[int, dict[str, object]],
         *,
         prune_cap: int | None = None,
+        keeps_cap: int | None = None,
     ) -> None:
         owner = _ORACLE_OWNER[op]
         seen = _observe(self.a)
@@ -344,6 +368,15 @@ class _Oracle:
             plain = [i for i in predicted if predicted[i]["durable"] is False]
             kept = [i for i in plain if i in seen]
             if (gone - set(plain)) or len(kept) != min(prune_cap, len(plain)):
+                self.broken.add(owner["lost"])
+        elif keeps_cap is not None and gone:
+            # A write or seed may keep the store at its cap on its own: it may
+            # drop the oldest non-durable records, never a durable one, and
+            # never so many that fewer than the cap remain.
+            existing = sorted(i for i in self.state if predicted[i]["durable"] is False)
+            oldest_first = set(existing[: len(gone)])
+            remaining = [i for i in seen if seen[i].durable is False]
+            if gone != oldest_first or len(remaining) < keeps_cap:
                 self.broken.add(owner["lost"])
         elif gone:
             self.broken.add(owner["lost"])
@@ -380,11 +413,18 @@ class _Oracle:
             for rid, r in self.state.items()
         }
 
-    def write(self, payload: str, trust: str | None, durable: bool = False) -> int:
+    def write(
+        self,
+        payload: str,
+        trust: str | None,
+        durable: bool = False,
+        channel: str = c.IN_BAND,
+    ) -> int:
         rid = self.a.write(
-            payload, source_trust=trust, channel=c.IN_BAND, durable=durable
+            payload, source_trust=trust, channel=channel, durable=durable
         )
-        label = c.AGENT if trust in (None, c.OPERATOR) else trust
+        clamped = trust == c.OPERATOR and channel == c.IN_BAND
+        label = c.AGENT if trust is None or clamped else trust
         predicted = self._now()
         predicted[rid] = {
             "trust": label,
@@ -392,8 +432,8 @@ class _Oracle:
             "payload": payload,
             "durable": durable,
         }
-        self._judge("write", predicted)
-        if self.a.clamp_recorded(rid) is not (trust == c.OPERATOR):
+        self._judge("write", predicted, keeps_cap=self.a.prune_cap())
+        if self.a.clamp_recorded(rid) is not clamped:
             self.broken.add("VL-1")
         return rid
 
@@ -406,7 +446,7 @@ class _Oracle:
             "payload": payload,
             "durable": False,
         }
-        self._judge("seed", predicted)
+        self._judge("seed", predicted, keeps_cap=self.a.prune_cap())
         return rid
 
     def activate(self, rid: int) -> None:
@@ -436,79 +476,59 @@ class _Oracle:
         self.a.prune()
         self._judge("prune", self._now(), prune_cap=self.a.prune_cap())
 
-    def others(self) -> None:
-        self.write("o-agent", c.AGENT)
-        self.write("o-ingested", c.INGESTED, durable=True)
-        self.seed("o-operator")
 
-
-def _oracle_gate_and_labels(a: LedgerAdapter) -> set[str]:
+def _oracle_run(a: LedgerAdapter, scenario: Scenario) -> set[str]:
+    """The oracle's own interpretation of one shared scenario."""
     o = _Oracle(a)
-    o.others()
-    for trust in (c.AGENT, c.INGESTED, None, c.OPERATOR):
-        o.write(f"w-{trust}", trust)
-    o.activate(o.seed("directive"))
-    for trust in (c.AGENT, c.INGESTED):
-        o.activate(o.write("refused", trust))
-        o.promote(o.write("in-band", trust), c.IN_BAND)
-    target = o.write("ceremony", c.AGENT)
-    o.promote(target, c.OUT_OF_BAND)
-    o.activate(target)  # now operator: the fast path
+    named: dict[str, int] = {}
+    for step in scenario.steps(a.prune_cap()):
+        if step.op == "write":
+            named[step.name] = o.write(
+                step.name, step.trust, step.durable, step.channel
+            )
+        elif step.op == "seed":
+            named[step.name] = o.seed(step.name)
+        elif step.op == "activate":
+            o.activate(named[step.name])
+        elif step.op == "promote":
+            o.promote(named[step.name], step.channel)
+        elif step.op == "prune":
+            o.prune()
+        elif step.op == "expect_healthy":
+            if a.health_ok() is not True or a.durable_violations() != 0:
+                o.broken.add("VL-4")
+        elif step.op == "force_loss":
+            if named[step.name] in o.state:
+                a.force_durable_loss(named[step.name])
+        elif step.op == "expect_loss_reported":
+            if a.health_ok() is not False or a.durable_violations() <= 0:
+                o.broken.add("VL-4")
+        else:  # pragma: no cover - a new step kind must be taught to the oracle
+            raise AssertionError(f"unknown step {step.op}")
     return o.broken
 
 
-def _oracle_retention(a: LedgerAdapter) -> set[str]:
-    o = _Oracle(a)
-    cap = a.prune_cap()
-    o.write("kept", c.AGENT, durable=True)
-    for i in range(cap + 3):
-        o.write(f"n{i}", c.AGENT)
-    o.write("shipped", c.INGESTED, durable=True)
-    o.prune()
-    broken = set(o.broken)
-    if a.count_records() != cap + 2 or a.health_ok() is not True:
-        broken.add("VL-4")
-    # Loss detection, on a clean store.
-    o = _Oracle(a)
-    rid = o.write("lost", c.AGENT, durable=True)
-    if a.health_ok() is not True or a.durable_violations() != 0:
-        broken.add("VL-4")
-    a.force_durable_loss(rid)
-    if a.health_ok() is not False or a.durable_violations() <= 0:
-        broken.add("VL-4")
-    return broken | o.broken
-
-
-def _oracle_envelopes(a: LedgerAdapter) -> set[str]:
-    o = _Oracle(a)
-    o.others()
-    o.activate(o.seed("directive"))
-    for trust in (c.INGESTED, c.OPERATOR):
-        o.activate(o.write("refused", trust))
-        o.promote(o.write("in-band", trust), c.IN_BAND)
-    rid = o.write("ceremony", c.AGENT)
-    o.promote(rid, c.OUT_OF_BAND)
-    o.write("kept", c.AGENT, durable=True)
-    for i in range(a.prune_cap() + 1):
-        o.write(f"n{i}", c.AGENT)
-    o.prune()
-    return {"VL-3"} & o.broken
+def _oracle_broken(a: LedgerAdapter) -> set[str]:
+    broken: set[str] = set()
+    for scenario in SCENARIOS:
+        broken |= _oracle_run(a, scenario)
+    return broken
 
 
 def spec_vl1(a: LedgerAdapter) -> bool:
-    return "VL-1" not in _oracle_gate_and_labels(a)
+    return "VL-1" not in _oracle_broken(a)
 
 
 def spec_vl2(a: LedgerAdapter) -> bool:
-    return "VL-2" not in _oracle_gate_and_labels(a)
+    return "VL-2" not in _oracle_broken(a)
 
 
 def spec_vl3(a: LedgerAdapter) -> bool:
-    return not _oracle_envelopes(a)
+    return "VL-3" not in _oracle_broken(a)
 
 
 def spec_vl4(a: LedgerAdapter) -> bool:
-    return "VL-4" not in _oracle_retention(a)
+    return "VL-4" not in _oracle_broken(a)
 
 
 SPEC: dict[str, Callable[[LedgerAdapter], bool]] = {
@@ -826,7 +846,7 @@ def test_suite_is_sound_for_vl4(policy: Policy) -> None:
 
 
 ALL_POLICIES: list[Policy] = [
-    Policy(cl, ac, pib, poob, born, env, pr, he)
+    Policy(cl, ac, pib, poob, born, env, pr, he, ap)
     for cl in ("agent", "ingested", "none", "agent_plus_shadow")
     for ac in (
         "gate",
@@ -842,26 +862,35 @@ ALL_POLICIES: list[Policy] = [
     for env in ("honest", "agent_as_operator", "operator_label", "missing")
     for pr in ("correct", "drop_durable", "noop")
     for he in ("honest", "always_ok")
+    for ap in (False, True)
 ]
 
 
+def oracle_verdict(store: LedgerAdapter) -> dict[str, bool]:
+    broken = _oracle_broken(store)
+    return {inv: inv not in broken for inv in INVARIANTS}
+
+
+def suite_verdict(store: LedgerAdapter) -> dict[str, bool]:
+    return {s.invariant: s.passed for s in score_adapter(store).invariants}
+
+
 def test_suite_is_sound_and_complete_over_every_configurable_store() -> None:
-    # Exhaustive, not sampled: every store in the family, every invariant.
-    # Sound: the suite passes an invariant only if the spec oracle does.
-    # Complete: the oracle accepting an invariant means the suite passes it.
-    assert len(ALL_POLICIES) == 18432
-    unsound: list[tuple[str, Policy]] = []
-    incomplete: list[tuple[str, Policy]] = []
-    for policy in ALL_POLICIES:
-        passes = suite_passes(policy)
-        for inv, check in SPEC.items():
-            truth = check(PolicyStore(policy))
-            if passes[inv] and not truth:
-                unsound.append((inv, policy))
-            if truth and not passes[inv]:
-                incomplete.append((inv, policy))
-    assert not unsound, unsound[:3]
-    assert not incomplete, incomplete[:3]
+    # Exhaustive, not sampled: every store in the family, every invariant. The
+    # suite and the oracle return the same verdict, which is both soundness
+    # (the suite passes an invariant only if the oracle does) and completeness
+    # (the reverse).
+    assert len(ALL_POLICIES) == 36864
+    disagree = [
+        (
+            policy,
+            suite_verdict(PolicyStore(policy)),
+            oracle_verdict(PolicyStore(policy)),
+        )
+        for policy in ALL_POLICIES
+        if suite_verdict(PolicyStore(policy)) != oracle_verdict(PolicyStore(policy))
+    ]
+    assert not disagree, disagree[:3]
 
 
 # --- adversarial pass over every state a probe reads (round 3 review) ---
@@ -1008,6 +1037,15 @@ _ORACLE_OP = {
     "prune": "prune",
 }
 _OTHER_TRUST = {c.OPERATOR: c.AGENT, c.AGENT: c.OPERATOR, c.INGESTED: c.OPERATOR}
+WRITE_KINDS = ("agent", "ingested", "unlabeled", "clamped")
+
+
+def _write_kind(source_trust: str | None, channel: str) -> str:
+    if source_trust is None:
+        return "unlabeled"
+    if source_trust == c.OPERATOR and channel == c.IN_BAND:
+        return "clamped"
+    return source_trust
 
 
 @dataclass(frozen=True)
@@ -1020,7 +1058,11 @@ class Mutation:
     def owner(self) -> str:
         if self.field == "envelope":
             return "VL-3"
-        key = {"created": "extra", "removed": "lost"}.get(self.field, self.field)
+        key = {"created": "extra", "removed": "lost", "refused": "actionable"}.get(
+            self.field, self.field
+        )
+        if self.scope == "cap":
+            key = "lost"
         return _ORACLE_OWNER[_ORACLE_OP[self.op]][key]
 
     def __str__(self) -> str:
@@ -1045,19 +1087,47 @@ MUTATIONS: list[Mutation] = [
             "seed_operator",
         )  # a write that stores nothing is not a one-field change
     ),
+    # Round 4 review: faults that only one kind of request triggers.
+    # A write of one kind (agent, ingested, unlabeled, or an in-band operator
+    # request that gets clamped) comes out actionable.
+    *(Mutation("write", kind, "actionable") for kind in WRITE_KINDS),
+    # An operator record promoted out-of-band refuses the fast path.
+    Mutation("activate_operator", "promoted", "refused"),
+    # Keeping to the cap on write or seed, wrongly: dropping a durable record,
+    # or dropping more non-durable records than the cap requires.
+    *(
+        Mutation(op, "cap", how)
+        for op in ("write", "seed_operator")
+        for how in ("durable", "over")
+    ),
 ]
 
 
 class MutantStore:
     """An honest PolicyStore whose one operation also applies one forbidden change."""
 
-    def __init__(self, mutation: Mutation) -> None:
+    def __init__(self, mutation: Mutation, policy: Policy = HONEST) -> None:
         self.m = mutation
-        self.inner = PolicyStore(HONEST)
+        self.inner = PolicyStore(policy)
         self.stale: dict[int, str] = {}  # envelope labels left wrong on purpose
+        self.promoted: set[int] = set()  # records promoted out-of-band
+
+    def _wrong_cap(self, op: str, new: int) -> None:
+        if self.m.op != op or self.m.scope != "cap":
+            return
+        rows = self.inner.rows
+        if self.m.field == "durable":
+            durable = sorted(i for i, r in rows.items() if r.durable and i != new)
+            if durable:
+                del rows[durable[0]]
+        else:
+            plain = sorted(i for i, r in rows.items() if not r.durable)
+            if len(plain) >= CAP:
+                for i in plain[: len(plain) - (CAP - 1)]:
+                    del rows[i]
 
     def _mutate(self, op: str, target: int, other: int | None = None) -> None:
-        if op != self.m.op:
+        if op != self.m.op or self.m.scope not in ("target", "other", "store"):
             return
         rows = self.inner.rows
         if other is None:
@@ -1089,6 +1159,7 @@ class MutantStore:
     def fresh(self) -> None:
         self.inner.fresh()
         self.stale = {}
+        self.promoted = set()
 
     def write(
         self, payload: str, *, source_trust: str | None, channel: str, durable: bool
@@ -1096,15 +1167,24 @@ class MutantStore:
         rid = self.inner.write(
             payload, source_trust=source_trust, channel=channel, durable=durable
         )
-        self._mutate("write", rid)
+        if self.m.op == "write" and self.m.scope in WRITE_KINDS:
+            if self.m.scope == _write_kind(source_trust, channel):
+                self.inner.rows[rid].actionable = True
+        elif self.m.scope != "cap":
+            self._mutate("write", rid)
+        self._wrong_cap("write", rid)
         return rid
 
     def seed_operator(self, payload: str) -> int:
         rid = self.inner.seed_operator(payload)
-        self._mutate("seed_operator", rid)
+        if self.m.scope != "cap":
+            self._mutate("seed_operator", rid)
+        self._wrong_cap("seed_operator", rid)
         return rid
 
     def activate(self, record_id: int, *, channel: str) -> bool:
+        if self.m.scope == "promoted" and record_id in self.promoted:
+            return False  # refuses the fast path for promoted records
         op = (
             "activate_operator"
             if self.inner.rows[record_id].trust == c.OPERATOR
@@ -1116,6 +1196,8 @@ class MutantStore:
 
     def promote(self, record_id: int, *, channel: str) -> bool:
         result = self.inner.promote(record_id, channel=channel)
+        if channel == c.OUT_OF_BAND:
+            self.promoted.add(record_id)
         self._mutate(
             "promote_out_of_band" if channel == c.OUT_OF_BAND else "promote_in_band",
             record_id,
@@ -1164,7 +1246,9 @@ def test_mutation_family_size() -> None:
     # 7 operations x 2 records x 5 fields, plus a side record per operation,
     # plus a dropped non-target per operation and a dropped target for the 5
     # operations that have an existing target.
-    assert len(MUTATIONS) == 7 * 2 * 5 + 7 + 7 + 5 == 89
+    # Round 4 adds 4 write kinds coming out actionable, the promoted record that
+    # refuses activation, and 4 wrong ways to keep to the cap.
+    assert len(MUTATIONS) == 7 * 2 * 5 + 7 + 7 + 5 + 4 + 1 + 4 == 98
     assert len({str(m) for m in MUTATIONS}) == len(MUTATIONS)
 
 
@@ -1190,3 +1274,113 @@ def test_round_3_codex_cases_are_in_the_generated_family() -> None:
         m = next(m for m in MUTATIONS if str(m) == case)
         assert m.owner == owner
         assert not score_adapter(MutantStore(m)).perfect
+
+
+# --- round 4 review: the three Codex cases, pinned by name ---
+
+
+class _ClampedWritesActionable(PolicyStore):
+    """Honest, except that a clamped in-band operator write comes out actionable."""
+
+    def write(
+        self, payload: str, *, source_trust: str | None, channel: str, durable: bool
+    ) -> int:
+        rid = super().write(
+            payload, source_trust=source_trust, channel=channel, durable=durable
+        )
+        if source_trust == c.OPERATOR and channel == c.IN_BAND:
+            self.rows[rid].actionable = True
+        return rid
+
+
+@dataclass
+class _PromotedNotActivatable(PolicyStore):
+    """Honest, except that a record promoted out-of-band refuses activation."""
+
+    promoted: set[int] = field(default_factory=lambda: set())
+
+    def promote(self, record_id: int, *, channel: str) -> bool:
+        if channel == c.OUT_OF_BAND:
+            self.promoted.add(record_id)
+        return super().promote(record_id, channel=channel)
+
+    def activate(self, record_id: int, *, channel: str) -> bool:
+        if record_id in self.promoted:
+            return False
+        return super().activate(record_id, channel=channel)
+
+
+def test_clamped_writes_coming_out_actionable_fail_vl2() -> None:
+    store = _ClampedWritesActionable(HONEST)
+    assert {s.invariant for s in score_adapter(store).invariants if not s.passed} == {
+        "VL-2"
+    }
+    assert oracle_verdict(_ClampedWritesActionable(HONEST))["VL-2"] is False
+
+
+def test_promoted_records_refusing_the_fast_path_fail_vl2() -> None:
+    store = _PromotedNotActivatable(HONEST)
+    assert {s.invariant for s in score_adapter(store).invariants if not s.passed} == {
+        "VL-2"
+    }
+    assert oracle_verdict(_PromotedNotActivatable(HONEST))["VL-2"] is False
+
+
+def test_an_honest_auto_pruning_store_scores_perfect() -> None:
+    # The adapter contract allows pruning on write; such a store is honest.
+    policy = replace(HONEST, auto_prune=True)
+    assert score_adapter(PolicyStore(policy)).perfect
+    assert all(oracle_verdict(PolicyStore(policy)).values())
+
+
+def _every_pinned_store() -> list[tuple[str, Callable[[], LedgerAdapter]]]:
+    stores: list[tuple[str, Callable[[], LedgerAdapter]]] = [
+        (
+            f"mutation {m} auto_prune={auto}",
+            lambda m=m, auto=auto: MutantStore(m, replace(HONEST, auto_prune=auto)),
+        )
+        for m in MUTATIONS
+        for auto in (False, True)
+    ]
+    stores += [
+        ("clamped-actionable", lambda: _ClampedWritesActionable(HONEST)),
+        ("promoted-not-activatable", lambda: _PromotedNotActivatable(HONEST)),
+        ("reference", ReferenceAdapter),
+    ]
+    for cls in (
+        _ActivateRewritesPayload,
+        _ActivateFlipsDurable,
+        _ActivateTouchesBystander,
+        _RefusedActivateRewritesPayload,
+        _RefusedPromoteFlipsDurable,
+        _PromoteAlsoActivates,
+        _PromoteRewritesPayload,
+        _PromoteFlipsDurable,
+        _PruneDemotesDurable,
+        _PruneRewritesDurable,
+        _SilentClamp,
+        _DefaultIngested,
+        _UncountedLoss,
+    ):
+        for auto in (False, True):
+            stores.append(
+                (
+                    f"{cls.__name__} auto_prune={auto}",
+                    lambda cls=cls, auto=auto: cls(replace(HONEST, auto_prune=auto)),
+                )
+            )
+    return stores
+
+
+@pytest.mark.parametrize(
+    ("name", "make"),
+    _every_pinned_store(),
+    ids=lambda v: v if isinstance(v, str) else "",
+)
+def test_suite_and_oracle_agree_on_every_pinned_store(
+    name: str, make: Callable[[], LedgerAdapter]
+) -> None:
+    # The adversarial pass: no store the oracle rejects passes the suite, and
+    # no store the suite rejects passes the oracle, on every mutation and every
+    # hand-written store, with and without pruning on write.
+    assert suite_verdict(make()) == oracle_verdict(make()), name
