@@ -1,8 +1,8 @@
 # The Verification Ledger Contract
 
 Version 1 (draft). This document is the product. The reference implementation and
-the conformance suite in this repository exist to prove the contract is
-satisfiable and to let any store demonstrate it enforces the contract.
+the conformance suite in this repository exist to show the contract is
+satisfiable and to test how a store enforces it.
 
 ## Why this exists
 
@@ -20,9 +20,10 @@ failure modes:
 
 A README that says "please label your handoffs" or "don't prune shipped rows" is
 a *word-level* guarantee: it holds roughly as often as everyone remembers to
-follow it. The Verification Ledger turns those two guarantees into *mechanisms* —
-properties of the store that hold regardless of what any agent does — and ships a
-conformance suite that mechanically proves a given store enforces them.
+follow it. The Verification Ledger turns those two guarantees into *mechanisms*:
+properties of the store that hold regardless of what any agent does. It ships a
+conformance suite that tests a store against them; what that test establishes,
+and what no test can, is stated under "What the suite establishes" below.
 
 ## The trust model
 
@@ -166,6 +167,28 @@ neither degenerate store scores well:
 
 Only a store that keeps the legitimate path open *and* closes the laundering path
 scores `1.0`. The bundled reference implementation is required to score `1.0`.
+
+### What the suite establishes
+
+The claim is a testable one. The suite fails every store in the documented
+mutation family on exactly the invariant that store breaks, passes the reference
+store and its documented conforming variants, and agrees with the independent
+oracle on all of them. The family is in the property tests:
+
+- 36864 configurable stores, each a mix of honest and broken mechanisms, checked
+  exhaustively;
+- 125 generated mutations: every operation, every field of the target and of
+  another record, side and dropped records, every return value the contract
+  defines, and every kind of record (agent, ingested, unlabeled, clamped
+  operator request) through every gate operation;
+- conforming variants that must score 1.00: ids handed out in increasing,
+  decreasing and shuffled order, with and without pruning on write.
+
+No finite suite proves soundness against every possible adapter. A store can
+behave correctly on every scripted scenario and still misbehave on inputs,
+sequences or timings the scenarios do not reach. A score of 1.00 is evidence
+against the documented family, not a proof that an arbitrary store enforces the
+contract.
 
 ## The adapter contract
 

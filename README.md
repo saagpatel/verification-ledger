@@ -1,15 +1,17 @@
 # verification-ledger
 
-A governed coordination ledger for local multi-agent fleets — and an executable
-conformance suite that proves a store enforces its guarantees.
+A governed coordination ledger for local multi-agent fleets, and an executable
+conformance suite that tests whether a store enforces its guarantees.
 
 Most agent fleets share state through a plain file or an ungoverned store. That
 lets one agent's output silently become the next agent's "operator intent"
 (laundering), and lets ordinary housekeeping silently drop a durable record
 (loss). A README asking everyone to be careful is a word-level guarantee. This
-project makes the guarantees *mechanisms* — properties of the store that hold
-regardless of what any agent does — and ships a test suite that mechanically
-proves a given store enforces them.
+project makes the guarantees *mechanisms*: properties of the store that hold
+regardless of what any agent does. It ships a test suite that fails every store
+in a documented family of broken stores on exactly the guarantee it breaks and
+passes the reference store. No finite suite proves an arbitrary store sound; see
+SPEC.md, "What the suite establishes".
 
 The argument, in full: [docs/methodology.md](docs/methodology.md). The precise
 contract: [SPEC.md](SPEC.md).

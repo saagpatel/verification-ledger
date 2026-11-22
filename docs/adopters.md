@@ -46,7 +46,7 @@ def seed_operator(self, payload: str) -> int:
 ```
 
 Both are legitimate out-of-band paths to an operator record. Because the VL-2
-*adversarial* probes independently prove the in-band path to `operator` stays
+*adversarial* probes independently check that the in-band path to `operator` stays
 closed, letting each adapter declare its own seed here does not weaken the score
 — it only stops the *positive* probe from hard-coding the reference's mechanics.
 

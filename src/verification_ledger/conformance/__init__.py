@@ -1,4 +1,4 @@
-"""The conformance suite: executable proof that a store enforces the contract.
+"""The conformance suite: executable tests of whether a store enforces the contract.
 
 Runs bidirectional probes (positive + adversarial) per invariant against any
 store that implements the ``LedgerAdapter`` protocol, and reports a top-line

@@ -27,10 +27,10 @@ one hundred.
 
 ## The move: make the guarantee a property of the store
 
-The Verification Ledger turns those two guarantees into mechanisms — properties
-of the store that hold regardless of what any agent does — and ships an
-executable conformance suite that proves a given store enforces them. The store
-is small and boring; the interesting part is that the guarantees are *checkable*.
+The Verification Ledger turns those two guarantees into mechanisms: properties of
+the store that hold regardless of what any agent does. It ships an executable
+conformance suite that tests a given store against them. The store is small and
+boring; the interesting part is that the guarantees are *checkable*.
 
 Four invariants, stated precisely in [SPEC.md](../SPEC.md):
 
@@ -66,7 +66,7 @@ consumer can ignore it. That is exactly why VL-2 exists. The envelope is the
 signal; the gate is the enforcement. A store that shipped only the envelope would
 be back to a word-level guarantee dressed up in JSON.
 
-## The conformance suite: proving the guarantee, not asserting it
+## The conformance suite: testing the guarantee, not asserting it
 
 A README that claims "this store enforces provenance" is itself a word-level
 guarantee. So the guarantees ship with a test anyone can run.
@@ -77,7 +77,8 @@ probes** (the legitimate path still works) and **adversarial probes** (the attac
 is blocked). An invariant passes only if *both* rates are perfect. The top-line
 Ledger Conformance Score is the fraction of the four invariants fully passed.
 
-The metric is bidirectional by construction, which is what makes it hard to game:
+The metric is bidirectional by construction, which is what makes both degenerate
+strategies fail:
 
 - A **block-everything** store fails the positive probes — the legitimate
   operator path is broken.
@@ -85,9 +86,11 @@ The metric is bidirectional by construction, which is what makes it hard to game
   blocked.
 
 Only a store that keeps the legitimate path open *and* closes the laundering path
-scores well. This is the same discipline that makes a good benchmark
-un-gameable: reward both the true positive and the true negative, so neither
-degenerate strategy wins.
+scores well. This is the same discipline that makes a good benchmark harder to
+game: reward both the true positive and the true negative, so neither degenerate
+strategy wins. It is evidence, not proof: the suite fails a documented family of
+broken stores on exactly the invariant each breaks, and no finite suite can
+promise to catch every broken store.
 
 ## The suite was adversarially broken before it shipped
 
