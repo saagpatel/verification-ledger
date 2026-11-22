@@ -2,8 +2,12 @@
 
 `VerificationLedger.tla` models the reference store in `src/verification_ledger`
 as a state machine: records with provenance labels, the promotion gate, the
-retention pass and its health check, several concurrent in-band agents, one
-out-of-band operator, and an adversary with store-level access. TLC checks
+retention pass, the durable receipts (each with a content digest and a link
+in a hash chain, plus the chain's length and head in the store metadata) and
+the health check that re-verifies them, several concurrent in-band agents, one
+out-of-band operator, and an adversary with store-level access. Digests and
+hashes are modeled as ideal (injective): a digest is the pair of record id and
+content version, and a link is the whole sequence of digests up to it. TLC checks
 VL-1, VL-2 and VL-4 exhaustively on a bounded model. VL-3 (the read envelope) is
 a pure function of a record's label and is covered by the property tests, not
 here.
@@ -34,14 +38,17 @@ the two statements of `activate()` and `prune()` are all explored.
 
 | Config | Mechanisms | Expected |
 |---|---|---|
-| `VerificationLedger` | all real mechanisms; adversary may delete or demote a durable row (receipt kept) | no violation |
+| `VerificationLedger` | all real mechanisms; adversary may delete, demote or overwrite a row (receipts untouched) | no violation |
 | `Control_GateDecisionOnly` | `evaluate_activation` allows everything; the SQL guard stays | no violation (the guard is a real second line) |
 | `Control_GateSkipsCheck` | no trust check and no SQL guard on activation | `VL2_ActionableIsOperator` violated |
 | `Control_NoClamp` | in-band operator write stored as operator | `VL1_Clamp` violated |
 | `Control_PromotionIgnoresChannel` | in-band promotion allowed | `VL1_OperatorOnlyOutOfBand` violated |
 | `Control_PruneSelectionOnly` | `select_prunable` targets durable rows; the `durable = 0` DELETE backstop stays | no violation (the backstop is a real second line) |
 | `Control_PruneIgnoresDurable` | selection and DELETE both ignore `durable` | `VL4_DurableKept` violated |
-| `Finding_ReceiptErased` | adversary deletes a durable row **and** its receipt | `VL4_LossDetected` violated (a real gap, see below) |
+| `Finding_ReceiptErased` | adversary deletes a durable receipt, with or without its row, anywhere in the chain | no violation (was a violation before the hash chain) |
+| `Control_HealthIgnoresDigest` | health skips the digest comparison; adversary may overwrite | `VL4_LossDetected` violated (an overwrite goes unseen) |
+| `Control_HealthIgnoresChainMeta` | health skips the length and head check; adversary may erase receipts | `VL4_LossDetected` violated (erasing the newest receipt leaves every link valid) |
+| `Control_ConsistentChainRewrite` | adversary overwrites or erases, then recomputes every digest, link and the metadata | `VL4_LossDetected` violated: the documented out-of-scope case, undetectable without an anchor outside the store |
 | `Witness_FastPath` | all real mechanisms; checks `NoRecordEverActionable` | violated, which exhibits an operator record becoming actionable |
 
 ## Invariants and properties
@@ -57,7 +64,8 @@ the two statements of `activate()` and `prune()` are all explored.
 | `VL2_PromotionIsExact` | action property | the out-of-band ceremony changes one exact record's label and nothing else |
 | `VL2_FastPathOpen` | action property | the guarded UPDATE on a live operator record sets actionable |
 | `VL4_DurableKept` | invariant | no API action removes or demotes a durable record |
-| `VL4_LossDetected` | invariant | any durable record that is gone or demoted makes `health()` report it |
+| `VL4_LossDetected` | invariant | any durable record that is gone, demoted or overwritten makes `health()` report it, including when its receipt was removed too (short of a consistent whole-chain rewrite) |
+| `VL4_NoFalseAlarm` | invariant | with no tampering, every interleaving leaves `health()` ok, so writes keep the chain and metadata consistent |
 
 ## Where the code and SPEC.md differ
 
@@ -90,33 +98,47 @@ the two statements of `activate()` and `prune()` are all explored.
 7. **`ingested` is not treated more strictly than `agent`.** SPEC.md calls it
    the strictest label; in the code the two are handled identically (both
    refused, both promotable out-of-band). The model reflects the code.
-8. **Loss detection is receipt-based, inside the same store.** A durable row
-   removed together with its receipt leaves no orphan, so `health()` stays ok.
-   `Finding_ReceiptErased` shows TLC finding exactly that trace.
+8. **Detection evidence lives in the same store.** Receipts carry digests and
+   hash-chain links and the metadata keeps the chain's length and head, so an
+   overwrite or a removed receipt (even the newest) is reported. A writer who
+   recomputes the whole chain and metadata consistently is not;
+   `Control_ConsistentChainRewrite` shows that trace. SPEC.md states this scope.
+9. **The durable write is one step.** `write()` inserts the row first (taking
+   SQLite's write lock), then reads the chain head and appends the receipt in
+   the same transaction, so no other writer can slip in between; it is modeled
+   as one atomic step.
 
 ## Results
 
-TLC 2.x, 4 workers, breadth-first, on the bounds above. "Generated" and
+TLC 2.x, 6 workers, breadth-first, on the bounds above. "Generated" and
 "distinct" are TLC's state counts and "depth" is the search depth TLC reports
-(multi-worker BFS reports 21 or 22 for the full model across runs). For a
-violation, "trace" is the number of states in TLC's shortest counterexample.
+(multi-worker BFS depth can vary by one between runs). For a violation,
+"trace" is the number of states in TLC's counterexample.
 
 | Config | Result | Generated | Distinct | Depth | Trace |
 |---|---|---:|---:|---:|---:|
-| `VerificationLedger` | no violation | 60,295,796 | 4,576,089 | 22 | |
-| `Control_GateDecisionOnly` | no violation | 97,330,588 | 7,482,311 | 21 | |
-| `Control_PruneSelectionOnly` | no violation | 86,873,406 | 6,959,459 | 22 | |
-| `Control_GateSkipsCheck` | `VL2_ActionableIsOperator` violated | 2,096 | 443 | 5 | 4 |
+| `VerificationLedger` | no violation | 565,526,780 | 40,783,771 | 24 | |
+| `Control_GateDecisionOnly` | no violation | 915,554,994 | 66,738,595 | 24 | |
+| `Control_PruneSelectionOnly` | no violation | 804,736,992 | 61,286,731 | 25 | |
+| `Finding_ReceiptErased` | no violation | 2,866,764,108 | 200,875,919 | 27 | |
+| `Control_GateSkipsCheck` | `VL2_ActionableIsOperator` violated | 1,089 | 258 | 6 | 6 |
 | `Control_NoClamp` | `VL1_Clamp` violated | 2 | 2 | 2 | 2 |
-| `Control_PromotionIgnoresChannel` | `VL1_OperatorOnlyOutOfBand` violated | 189 | 70 | 5 | 3 |
-| `Control_PruneIgnoresDurable` | `VL4_DurableKept` violated | 5,610 | 1,028 | 6 | 4 |
-| `Finding_ReceiptErased` | `VL4_LossDetected` violated | 828 | 201 | 5 | 5 |
-| `Witness_FastPath` | `NoRecordEverActionable` violated (expected) | 9,658 | 1,783 | 6 | 5 |
+| `Control_PromotionIgnoresChannel` | `VL1_OperatorOnlyOutOfBand` violated | 185 | 56 | 5 | 5 |
+| `Control_PruneIgnoresDurable` | `VL4_DurableKept` violated | 5,975 | 1,282 | 6 | 6 |
+| `Control_HealthIgnoresDigest` | `VL4_LossDetected` violated | 1,051 | 247 | 6 | 5 |
+| `Control_HealthIgnoresChainMeta` | `VL4_LossDetected` violated | 1,053 | 242 | 5 | 5 |
+| `Control_ConsistentChainRewrite` | `VL4_LossDetected` violated (out of scope, documented) | 934 | 198 | 5 | 3 |
+| `Witness_FastPath` | `NoRecordEverActionable` violated (expected) | 13,506 | 2,894 | 7 | 7 |
 
-Shortest traces, read from the logs:
+Traces, read from the logs:
 
-- `Control_GateSkipsCheck`: an agent writes record 1 (agent); an agent's
-  activation SELECT allows it; the UPDATE sets `actionable` on an agent record.
-- `Finding_ReceiptErased`: three writes, the third durable (receipt 3); the
-  adversary deletes row 3 and receipt 3; `Orphans = {}`, so `health()` is ok
-  while a durable record is gone.
+- `Control_GateSkipsCheck`: three writes; an agent's activation SELECT allows
+  an agent record; the UPDATE sets `actionable` on it.
+- `Control_HealthIgnoresDigest`: three writes; the adversary overwrites a
+  durable payload; with the digest check off, health stays ok.
+- `Control_HealthIgnoresChainMeta`: three writes; the adversary erases the
+  newest durable receipt (with its row); every remaining link is valid, so only
+  the length and head check would have caught it.
+- `Control_ConsistentChainRewrite`: one durable write; the adversary overwrites
+  it and recomputes its digest, every link and the metadata; health stays ok.
+  This is the case SPEC.md puts out of scope.
