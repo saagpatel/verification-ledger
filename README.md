@@ -98,9 +98,12 @@ python -m verification_ledger.conformance          # reference store (stdout sho
 #   Score 1.00  (4/4 invariants)
 ```
 
-Grade your own store: `python -m verification_ledger.conformance yourmodule:make`,
-replacing `yourmodule:make` with an importable factory that returns a fresh
-`LedgerAdapter`. Add `--json` for a machine-readable report. The methodology
+To grade your own store, bind your `LedgerAdapter` to a disposable test database.
+The suite resets the database to empty before each probe and deliberately deletes
+durable records to test loss detection. Run
+`python -m verification_ledger.conformance yourmodule:make`, replacing
+`yourmodule:make` with an importable factory that returns the adapter.
+Add `--json` for a machine-readable report. The methodology
 essay describes the store that passed the original probes while breaking VL-2.
 
 ## Develop
